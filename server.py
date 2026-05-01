@@ -22,7 +22,13 @@ class TraceError(Exception):
     details: str = ""
     status: int = HTTPStatus.BAD_REQUEST
 
-
+# add this helper
+def make_frame_key(stack_frames: list[dict[str, Any]], depth: int) -> str:
+    return " > ".join(
+        f"{f['name']}@{f['line']}"
+        for f in stack_frames[: depth + 1]
+    )
+    
 class CppTracer:
     def __init__(self) -> None:
         compiler = shutil.which("clang++") or shutil.which("g++")
@@ -31,6 +37,7 @@ class CppTracer:
         if not shutil.which("lldb"):
             raise TraceError("LLDB is not installed.", status=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.compiler = compiler
+
 
     def trace(self, code: str) -> dict[str, Any]:
         if not code.strip():
@@ -248,17 +255,25 @@ def emit_step(debugger, command, result, internal_dict):
             variables_by_depth: dict[int, list[dict[str, Any]]] = {}
             containers_by_depth: dict[int, dict[str, list[dict[str, Any]]]] = {}
             memory_by_depth: dict[int, dict[str, list[dict[str, str]]]] = {}
+
             for depth, raw_frame in enumerate(raw_frames):
                 variables, containers, memory = parse_frame_variables(
                     raw_frame.get("vars_raw", ""),
                     raw_frame.get("line", current_line),
                     declaration_lines
                 )
+
                 args = raw_frame.get("args", [])
                 stack_frames[depth]["args"] = args
+                stack_frames[depth]["id"] = make_frame_key(stack_frames, depth)
+                stack_frames[depth]["locals"] = variables
+                stack_frames[depth]["containers"] = containers
+                stack_frames[depth]["memory"] = memory
+
                 variables_by_depth[depth] = variables
                 containers_by_depth[depth] = containers
                 memory_by_depth[depth] = memory
+                
 
             # Build stack payload ONCE per step, outside the raw_frames loop
             stack_payload = []
@@ -285,16 +300,17 @@ def emit_step(debugger, command, result, internal_dict):
             event = describe_event(function_name, current_line, line_text)
             summary = describe_summary(function_name, line_text, len(stack_payload), merged_containers)
 
+            top_frame = stack_frames[0]
             steps.append(
                 {
                     "line": current_line,
                     "event": event,
                     "summary": summary,
                     "stdout": payload.get("stdout", "").rstrip(),
-                    "stack": stack_payload,
-                    "containers": merged_containers,
-                    "activeContainers": top_containers,
-                    "memory": merged_memory
+                    "stack": stack_frames,
+                    "containers": top_frame.get("containers", empty_containers()),
+                    "activeContainers": top_frame.get("containers", empty_containers()),
+                    "memory": top_frame.get("memory", empty_memory_graph())
                 }
             )
 
@@ -334,22 +350,27 @@ def emit_step(debugger, command, result, internal_dict):
             previous_values = current_values
 
     def _carry_forward_containers(self, steps: list[dict[str, Any]]) -> None:
-        last_seen = empty_containers()
+        last_seen: dict[str, dict[str, list[dict[str, Any]]]] = {}
+
+        kinds = ("arrays", "maps", "sets", "stacks", "queues", "priorityQueues", "lists", "graphs")
 
         for step in steps:
-            current = step.get("containers", empty_containers())
-            merged = empty_containers()
+            current_seen: dict[str, dict[str, list[dict[str, Any]]]] = {}
+            for frame in step["stack"]:
+                frame_id = frame["id"]
+                current = frame.get("containers", empty_containers())
+                prev = last_seen.get(frame_id, empty_containers())
 
-            for kind in ("arrays", "maps", "sets", "stacks", "queues", "priorityQueues", "lists", "graphs"):
-                current_items = current.get(kind, [])
-                if current_items:
-                    last_seen[kind] = current_items
-                merged[kind] = list(last_seen[kind])
+                merged = empty_containers()
+                for kind in kinds:
+                    merged[kind] = list(current[kind]) if current.get(kind) else list(prev[kind])
 
-            step["containers"] = merged
+                frame["containers"] = merged
+                current_seen[frame_id] = merged
+
+            last_seen = current_seen
 
     def _carry_forward_variables(self, steps: list[dict[str, Any]]) -> None:
-        """Persist locals within each frame across steps. Block-scoped vars disappear when LLDB stops listing them."""
         last_seen: dict[str, dict[str, Any]] = {}
 
         for step in steps:
@@ -358,12 +379,10 @@ def emit_step(debugger, command, result, internal_dict):
                 frame_id = frame["id"]
                 current = {var["name"]: dict(var) for var in frame.get("locals", [])}
 
-                if current:
-                    # LLDB gave us real variables for this frame → trust it (block scope respected)
-                    merged = current
-                else:
-                    # LLDB reported nothing → fall back to last known state
-                    merged = {name: dict(var) for name, var in last_seen.get(frame_id, {}).items()}
+                merged = current or {
+                    name: dict(var)
+                    for name, var in last_seen.get(frame_id, {}).items()
+                }
 
                 frame["locals"] = list(merged.values())
                 current_seen[frame_id] = merged
