@@ -360,32 +360,52 @@ def emit_step(debugger, command, result, internal_dict):
 
     def _attach_flow_nodes(self, steps: list[dict[str, Any]]) -> None:
         # Build a stable call tree across all steps.
-        # Key = function_name|depth_in_reversed_stack|call_id
-        # We use a monotonic call_id so every distinct activation gets its own node,
-        # which makes the recursion tree accurate and layout stable.
+        # Each distinct function activation gets its own node so the recursion
+        # tree is accurate even when the same function is called multiple times
+        # with identical (or no) arguments.
         seen_nodes: list[dict[str, Any]] = []
         seen_edges: list[dict[str, str]] = []
         node_index_by_key: dict[str, int] = {}
         edge_keys: set[str] = set()
         call_counter = 0
+        prev_keys: list[str] = []
 
         for step in steps:
             active_keys: list[str] = []
             path = list(reversed(step["stack"]))
             step_nodes: list[str] = []
+            current_keys: list[str] = []
+            prefix_still_matches = True
 
             for depth, frame in enumerate(path):
                 args = frame.get("args", []) or []
                 args_str = ", ".join(args)
-                # Use a stable key based on the call stack shape.
-                # For the same function at the same depth, if args changed we still
-                # treat it as the same logical node so the tree doesn't explode.
-                key = f"{frame['name']}:{depth}:{args_str}"
+                base_key = f"{frame['name']}:{depth}:{args_str}"
+
+                # Re-use the node from the previous step only when the entire
+                # ancestor chain is identical and the frame itself matches.
+                if prefix_still_matches and depth < len(prev_keys):
+                    prev_key = prev_keys[depth]
+                    prev_node = seen_nodes[node_index_by_key[prev_key]]
+                    if prev_node.get("base_key") == base_key:
+                        key = prev_key
+                    else:
+                        key = f"{base_key}:{call_counter}"
+                        call_counter += 1
+                        prefix_still_matches = False
+                else:
+                    key = f"{base_key}:{call_counter}"
+                    call_counter += 1
+                    prefix_still_matches = False
+
+                current_keys.append(key)
+
                 if key not in node_index_by_key:
                     node_index_by_key[key] = len(seen_nodes)
                     parent_key = active_keys[-1] if active_keys else None
                     seen_nodes.append({
                         "id": key,
+                        "base_key": base_key,
                         "label": format_flow_label(frame["name"], args),
                         "function": frame["name"],
                         "params": args,
@@ -401,6 +421,8 @@ def emit_step(debugger, command, result, internal_dict):
                 step_nodes.append(key)
                 active_keys.append(key)
 
+            prev_keys = current_keys
+
             step["tree"] = {
                 "nodes": [
                     {
@@ -412,7 +434,6 @@ def emit_step(debugger, command, result, internal_dict):
                 ],
                 "edges": [*seen_edges]
             }
-
 
 class AppHandler(SimpleHTTPRequestHandler):
     tracer = CppTracer()
