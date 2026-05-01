@@ -260,7 +260,7 @@ def emit_step(debugger, command, result, internal_dict):
                 containers_by_depth[depth] = containers
                 memory_by_depth[depth] = memory
 
-            # Build stack payload ONCE per step
+            # Build stack payload ONCE per step, outside the raw_frames loop
             stack_payload = []
             total_frames = len(stack_frames)
             for depth, frame in enumerate(stack_frames):
@@ -349,7 +349,7 @@ def emit_step(debugger, command, result, internal_dict):
             step["containers"] = merged
 
     def _carry_forward_variables(self, steps: list[dict[str, Any]]) -> None:
-        """Persist locals across steps, but let block-scoped variables disappear."""
+        """Persist locals within each frame across steps. Block-scoped vars disappear when LLDB stops listing them."""
         last_seen: dict[str, dict[str, Any]] = {}
 
         for step in steps:
@@ -359,7 +359,7 @@ def emit_step(debugger, command, result, internal_dict):
                 current = {var["name"]: dict(var) for var in frame.get("locals", [])}
 
                 if current:
-                    # LLDB gave us a real variable list → trust it (block scope respected)
+                    # LLDB gave us real variables for this frame → trust it (block scope respected)
                     merged = current
                 else:
                     # LLDB reported nothing → fall back to last known state
@@ -369,6 +369,8 @@ def emit_step(debugger, command, result, internal_dict):
                 current_seen[frame_id] = merged
 
             last_seen = current_seen
+
+
     def _attach_flow_nodes(self, steps: list[dict[str, Any]]) -> None:
         seen_nodes: list[dict[str, Any]] = []
         seen_edges: list[dict[str, str]] = []
