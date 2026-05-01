@@ -238,7 +238,6 @@ function render() {
   renderMemory(memoryStep);
   renderContainers(step);
 
-  // Per-step stdout
   if (step) {
     const out = (step.stdout ?? "").trim();
     if (out) {
@@ -392,12 +391,13 @@ function renderFlow(step) {
   dom.flowView.innerHTML = "";
 
   const nodes = step?.tree?.nodes || [];
+  const edges = step?.tree?.edges || [];
+
   if (!nodes.length) {
     dom.flowView.innerHTML = `<div class="empty-state">Recursion and nested call flow will appear here when detected.</div>`;
     return;
   }
 
-  const edges = step?.tree?.edges || [];
   const childrenMap = new Map();
   const parentSet = new Set();
   nodes.forEach((node) => childrenMap.set(node.id, []));
@@ -412,6 +412,7 @@ function renderFlow(step) {
   const roots = nodes
     .filter((node) => !parentSet.has(node.id))
     .map((node) => node.id);
+
   if (roots.length === 0 && nodes.length > 0) {
     roots.push(nodes[0].id);
   }
@@ -458,7 +459,7 @@ function renderFlow(step) {
   });
 
   const width = Math.max(NODE_W + PAD * 2, PAD * 2 + leafCursor * leafXStep);
-  const height = (treeMaxDepth + 1) * levelHeight + PAD * 2;
+  const height = Math.max(NODE_H + PAD * 2, (treeMaxDepth + 1) * levelHeight + PAD * 2);
 
   const edgeSvg = edges.map((edge) => {
     const from = positions.get(edge.from);
@@ -532,11 +533,9 @@ function renderMemory(step) {
 
   const CW = 160, CH = 56, HGAP = 24, VGAP = 72, PAD = 20;
 
-  // Separate variable nodes (top row) and address nodes (bottom row)
   const varNodes = nodes.filter(n => n.kind === "variable");
   const addrNodes = nodes.filter(n => n.kind !== "variable");
 
-  // Assign x positions per row
   const varX = new Map(varNodes.map((n, i) => [n.id, PAD + i * (CW + HGAP) + CW / 2]));
   const addrX = new Map(addrNodes.map((n, i) => [n.id, PAD + i * (CW + HGAP) + CW / 2]));
 
@@ -550,7 +549,6 @@ function renderMemory(step) {
   const svgW = PAD * 2 + totalCols * (CW + HGAP) - HGAP;
   const svgH = addrNodes.length ? addrY + CH / 2 + PAD : varY + CH / 2 + PAD;
 
-  // Build edge SVG with arrowhead marker
   const edgeSvg = edges.map(edge => {
     const x1 = xFor(edge.from), y1 = yFor(edge.from) + CH / 2;
     const x2 = xFor(edge.to),   y2 = yFor(edge.to) - CH / 2;
@@ -567,7 +565,6 @@ function renderMemory(step) {
     const isAddr = n.kind !== "variable";
     const cls = isAddr ? "memory-node address-node" : "memory-node variable-node";
     const label = escapeHtml(n.label || n.id);
-    // variable node subtitle: the address it holds (from edge target id)
     let sub = "";
     if (!isAddr) {
       const edge = edges.find(e => e.from === n.id);
@@ -605,211 +602,243 @@ function renderMemory(step) {
     </div>`;
 }
 
+function createContainerCard(name, type, typeClass, isActive) {
+  const card = document.createElement("div");
+  card.className = `container-card ct-${typeClass}${isActive ? " current-frame" : ""}`;
+  card.innerHTML = `<div class="container-title">
+    <strong>${escapeHtml(name)}</strong>
+    <span class="container-type">${type}</span>
+    <span class="container-origin">${isActive ? "active frame" : "parent frame"}</span>
+  </div>`;
+  return card;
+}
+
 function renderContainers(step) {
   dom.containersView.innerHTML = "";
 
-  const containers = normalizeContainers(step?.containers);
-  if (
-    !containers.arrays.length
-    && !containers.maps.length
-    && !containers.sets.length
-    && !containers.stacks.length
-    && !containers.queues.length
-    && !containers.priorityQueues.length
-    && !containers.lists.length
-    && !containers.graphs.length
-  ) {
+  if (!step?.stack?.length) {
     dom.containersView.innerHTML = `<div class="empty-state">Container-aware visuals show only when vector, deque, map, unordered_map, set, unordered_set, stack, queue, priority_queue, list, or graph data is available.</div>`;
     return;
   }
 
-  const frame = (name, type, typeClass, active) => {
-    const card = document.createElement("div");
-    card.className = `container-card ct-${typeClass}${active ? " current-frame" : ""}`;
-    card.innerHTML = `<div class="container-title">
-      <strong>${escapeHtml(name)}</strong>
-      <span class="container-type">${type}</span>
-      <span class="container-origin">${active ? "active frame" : "parent frame"}</span>
-    </div>`;
-    return card;
-  };
+  let hasAny = false;
 
-  // vector / deque / string — indexed horizontal cells
-  containers.arrays.forEach((array) => {
-    const active = isCurrentFrameContainer(step, array.name);
-    const card = frame(array.name, array.kind || "vector", "vector", active);
-    const grid = document.createElement("div");
-    grid.className = "ct-array-grid";
-    if (!array.values.length) {
-      grid.innerHTML = `<span class="ct-empty">empty</span>`;
-    } else {
-      array.values.forEach((value, i) => {
-        const cell = document.createElement("div");
-        cell.className = "ct-array-cell";
-        cell.innerHTML = `<div class="ct-idx">[${i}]</div><div class="ct-val">${escapeHtml(formatValue(value))}</div>`;
-        grid.append(cell);
-      });
-    }
-    card.append(grid);
-    dom.containersView.append(card);
-  });
+  step.stack.forEach((frame, frameIdx) => {
+    const containers = normalizeContainers(frame.containers);
+    if (countContainers(containers) === 0) return;
+    hasAny = true;
 
-  // map / unordered_map — key → value rows
-  containers.maps.forEach((map) => {
-    const active = isCurrentFrameContainer(step, map.name);
-    const card = frame(map.name, map.kind || "map", "map", active);
-    const table = document.createElement("div");
-    table.className = "ct-map-table";
-    if (!map.entries.length) {
-      table.innerHTML = `<span class="ct-empty">empty</span>`;
-    } else {
-      map.entries.forEach(([key, value]) => {
-        const row = document.createElement("div");
-        row.className = "ct-map-row";
-        row.innerHTML = `<span class="ct-map-key">${escapeHtml(formatValue(key))}</span>
-          <span class="ct-map-arrow">→</span>
-          <span class="ct-map-val">${escapeHtml(formatValue(value))}</span>`;
-        table.append(row);
-      });
-    }
-    card.append(table);
-    dom.containersView.append(card);
-  });
+    const section = document.createElement("div");
+    section.className = "frame-containers-section";
 
-  // set / unordered_set — bubble chips
-  containers.sets.forEach((set) => {
-    const active = isCurrentFrameContainer(step, set.name);
-    const card = frame(set.name, set.kind || "set", "set", active);
-    const wrap = document.createElement("div");
-    wrap.className = "ct-set-wrap";
-    if (!set.values.length) {
-      wrap.innerHTML = `<span class="ct-empty">empty</span>`;
-    } else {
-      set.values.forEach((v) => {
-        const chip = document.createElement("span");
-        chip.className = "ct-set-chip";
-        chip.textContent = formatValue(v);
-        wrap.append(chip);
-      });
-    }
-    card.append(wrap);
-    dom.containersView.append(card);
-  });
+    const header = document.createElement("div");
+    header.className = `frame-containers-header ${frame.active ? "active-frame-header" : ""}`;
+    header.innerHTML = `
+      <span class="frame-index">${frameIdx + 1}</span>
+      <strong>${escapeHtml(frame.name)}</strong>
+      <span class="frame-origin">${frame.active ? "active frame" : "parent frame"}</span>
+    `;
+    section.append(header);
 
-  // stack — vertical LIFO, top at top
-  containers.stacks.forEach((stack) => {
-    const active = isCurrentFrameContainer(step, stack.name);
-    const card = frame(stack.name, "stack", "stack", active);
-    const col = document.createElement("div");
-    col.className = "ct-stack-col";
-    if (!stack.values.length) {
-      col.innerHTML = `<span class="ct-empty">empty stack</span>`;
-    } else {
-      [...stack.values].reverse().forEach((v, i) => {
-        const item = document.createElement("div");
-        item.className = `ct-stack-item${i === 0 ? " ct-stack-top" : ""}`;
-        item.innerHTML = `<span class="ct-val">${escapeHtml(formatValue(v))}</span>${i === 0 ? `<span class="ct-badge">top</span>` : ""}`;
-        col.append(item);
-      });
-    }
-    card.append(col);
-    dom.containersView.append(card);
-  });
+    const content = document.createElement("div");
+    content.className = "frame-containers-content";
 
-  // queue — horizontal conveyor, front→rear
-  containers.queues.forEach((queue) => {
-    const active = isCurrentFrameContainer(step, queue.name);
-    const card = frame(queue.name, "queue", "queue", active);
-    const row = document.createElement("div");
-    row.className = "ct-queue-row";
-    if (!queue.values.length) {
-      row.innerHTML = `<span class="ct-empty">empty queue</span>`;
-    } else {
-      queue.values.forEach((v, i) => {
-        const item = document.createElement("div");
-        const isFirst = i === 0, isLast = i === queue.values.length - 1;
-        item.className = `ct-queue-item${isFirst ? " ct-queue-front" : ""}${isLast ? " ct-queue-rear" : ""}`;
-        item.innerHTML = `${isFirst ? `<span class="ct-badge">front</span>` : ""}
-          <span class="ct-val">${escapeHtml(formatValue(v))}</span>
-          ${isLast && !isFirst ? `<span class="ct-badge">rear</span>` : ""}`;
-        row.append(item);
-        if (i < queue.values.length - 1) {
-          const arr = document.createElement("span");
-          arr.className = "ct-queue-arrow";
-          arr.textContent = "→";
-          row.append(arr);
-        }
-      });
-    }
-    card.append(row);
-    dom.containersView.append(card);
-  });
-
-  // priority_queue — vertical heap, max at top
-  containers.priorityQueues.forEach((pq) => {
-    const active = isCurrentFrameContainer(step, pq.name);
-    const card = frame(pq.name, "priority_queue", "pqueue", active);
-    const col = document.createElement("div");
-    col.className = "ct-stack-col";
-    if (!pq.values.length) {
-      col.innerHTML = `<span class="ct-empty">empty priority_queue</span>`;
-    } else {
-      pq.values.forEach((v, i) => {
-        const item = document.createElement("div");
-        item.className = `ct-stack-item${i === 0 ? " ct-pq-top" : ""}`;
-        item.innerHTML = `<span class="ct-val">${escapeHtml(formatValue(v))}</span>${i === 0 ? `<span class="ct-badge">max</span>` : ""}`;
-        col.append(item);
-      });
-    }
-    card.append(col);
-    dom.containersView.append(card);
-  });
-
-  // list — horizontal linked nodes with arrows
-  containers.lists.forEach((list) => {
-    const active = isCurrentFrameContainer(step, list.name);
-    const card = frame(list.name, "list", "list", active);
-    const row = document.createElement("div");
-    row.className = "ct-list-row";
-    if (!list.values.length) {
-      row.innerHTML = `<span class="ct-empty">empty list</span>`;
-    } else {
-      list.values.forEach((v, i) => {
-        const node = document.createElement("div");
-        node.className = "ct-list-node";
-        node.textContent = formatValue(v);
-        row.append(node);
-        if (i < list.values.length - 1) {
-          const arr = document.createElement("span");
-          arr.className = "ct-list-arrow";
-          arr.textContent = "⇄";
-          row.append(arr);
-        }
-      });
-    }
-    card.append(row);
-    dom.containersView.append(card);
-  });
-
-  // graph — adjacency list with node + neighbor pills
-  containers.graphs.forEach((graph) => {
-    const active = isCurrentFrameContainer(step, graph.name);
-    const card = frame(graph.name, "graph", "graph", active);
-    const grid = document.createElement("div");
-    grid.className = "ct-graph-grid";
-    graph.edges.forEach(([node, neighbors]) => {
-      const row = document.createElement("div");
-      row.className = "ct-graph-row";
-      const nbHtml = Array.isArray(neighbors) && neighbors.length
-        ? neighbors.map((n) => `<span class="ct-graph-nb">${escapeHtml(formatValue(n))}</span>`).join("")
-        : `<span class="ct-empty">no edges</span>`;
-      row.innerHTML = `<div class="ct-graph-node">${escapeHtml(formatValue(node))}</div>
-        <div class="ct-graph-edges">${nbHtml}</div>`;
-      grid.append(row);
+    // Arrays: vector, deque, string
+    containers.arrays.forEach((array) => {
+      const typeClass = array.kind || "vector";
+      const card = createContainerCard(array.name, typeClass, typeClass, frame.active);
+      const grid = document.createElement("div");
+      grid.className = "ct-array-grid";
+      if (!array.values.length) {
+        grid.innerHTML = `<span class="ct-empty">empty</span>`;
+      } else {
+        array.values.forEach((value, i) => {
+          const cell = document.createElement("div");
+          cell.className = "ct-array-cell";
+          cell.innerHTML = `<div class="ct-idx">[${i}]</div><div class="ct-val">${escapeHtml(formatValue(value))}</div>`;
+          grid.append(cell);
+        });
+      }
+      card.append(grid);
+      content.append(card);
     });
-    card.append(grid);
-    dom.containersView.append(card);
+
+    // Maps
+    containers.maps.forEach((map) => {
+      const card = createContainerCard(map.name, map.kind || "map", "map", frame.active);
+      const table = document.createElement("div");
+      table.className = "ct-map-table";
+      if (!map.entries.length) {
+        table.innerHTML = `<span class="ct-empty">empty</span>`;
+      } else {
+        map.entries.forEach(([key, value]) => {
+          const row = document.createElement("div");
+          row.className = "ct-map-row";
+          row.innerHTML = `<span class="ct-map-key">${escapeHtml(formatValue(key))}</span>
+            <span class="ct-map-arrow">→</span>
+            <span class="ct-map-val">${escapeHtml(formatValue(value))}</span>`;
+          table.append(row);
+        });
+      }
+      card.append(table);
+      content.append(card);
+    });
+
+    // Sets
+    containers.sets.forEach((set) => {
+      const card = createContainerCard(set.name, set.kind || "set", "set", frame.active);
+      const wrap = document.createElement("div");
+      wrap.className = "ct-set-wrap";
+      if (!set.values.length) {
+        wrap.innerHTML = `<span class="ct-empty">empty</span>`;
+      } else {
+        set.values.forEach((v) => {
+          const chip = document.createElement("span");
+          chip.className = "ct-set-chip";
+          chip.textContent = formatValue(v);
+          wrap.append(chip);
+        });
+      }
+      card.append(wrap);
+      content.append(card);
+    });
+
+    // Stacks
+    containers.stacks.forEach((stack) => {
+      const card = createContainerCard(stack.name, "stack", "stack", frame.active);
+      const col = document.createElement("div");
+      col.className = "ct-stack-col";
+      if (!stack.values.length) {
+        col.innerHTML = `<span class="ct-empty">empty stack</span>`;
+      } else {
+        [...stack.values].reverse().forEach((v, i) => {
+          const item = document.createElement("div");
+          item.className = `ct-stack-item${i === 0 ? " ct-stack-top" : ""}`;
+          item.innerHTML = `<span class="ct-val">${escapeHtml(formatValue(v))}</span>${i === 0 ? `<span class="ct-badge">top</span>` : ""}`;
+          col.append(item);
+        });
+      }
+      card.append(col);
+      content.append(card);
+    });
+
+    // Queues
+    containers.queues.forEach((queue) => {
+      const card = createContainerCard(queue.name, "queue", "queue", frame.active);
+      const row = document.createElement("div");
+      row.className = "ct-queue-row";
+      if (!queue.values.length) {
+        row.innerHTML = `<span class="ct-empty">empty queue</span>`;
+      } else {
+        queue.values.forEach((v, i) => {
+          const item = document.createElement("div");
+          const isFirst = i === 0, isLast = i === queue.values.length - 1;
+          item.className = `ct-queue-item${isFirst ? " ct-queue-front" : ""}${isLast ? " ct-queue-rear" : ""}`;
+          item.innerHTML = `${isFirst ? `<span class="ct-badge">front</span>` : ""}
+            <span class="ct-val">${escapeHtml(formatValue(v))}</span>
+            ${isLast && !isFirst ? `<span class="ct-badge">rear</span>` : ""}`;
+          row.append(item);
+          if (i < queue.values.length - 1) {
+            const arr = document.createElement("span");
+            arr.className = "ct-queue-arrow";
+            arr.textContent = "→";
+            row.append(arr);
+          }
+        });
+      }
+      card.append(row);
+      content.append(card);
+    });
+
+    // Priority Queues
+    containers.priorityQueues.forEach((pq) => {
+      const card = createContainerCard(pq.name, "priority_queue", "pqueue", frame.active);
+      const col = document.createElement("div");
+      col.className = "ct-stack-col";
+      if (!pq.values.length) {
+        col.innerHTML = `<span class="ct-empty">empty priority_queue</span>`;
+      } else {
+        pq.values.forEach((v, i) => {
+          const item = document.createElement("div");
+          item.className = `ct-stack-item${i === 0 ? " ct-pq-top" : ""}`;
+          item.innerHTML = `<span class="ct-val">${escapeHtml(formatValue(v))}</span>${i === 0 ? `<span class="ct-badge">max</span>` : ""}`;
+          col.append(item);
+        });
+      }
+      card.append(col);
+      content.append(card);
+    });
+
+    // Lists
+    containers.lists.forEach((list) => {
+      const card = createContainerCard(list.name, "list", "list", frame.active);
+      const row = document.createElement("div");
+      row.className = "ct-list-row";
+      if (!list.values.length) {
+        row.innerHTML = `<span class="ct-empty">empty list</span>`;
+      } else {
+        list.values.forEach((v, i) => {
+          const node = document.createElement("div");
+          node.className = "ct-list-node";
+          node.textContent = formatValue(v);
+          row.append(node);
+          if (i < list.values.length - 1) {
+            const arr = document.createElement("span");
+            arr.className = "ct-list-arrow";
+            arr.textContent = "⇄";
+            row.append(arr);
+          }
+        });
+      }
+      card.append(row);
+      content.append(card);
+    });
+
+    // Graphs
+    containers.graphs.forEach((graph) => {
+      const card = createContainerCard(graph.name, "graph", "graph", frame.active);
+      const grid = document.createElement("div");
+      grid.className = "ct-graph-grid";
+      graph.edges.forEach(([node, neighbors]) => {
+        const row = document.createElement("div");
+        row.className = "ct-graph-row";
+        const nbHtml = Array.isArray(neighbors) && neighbors.length
+          ? neighbors.map((n) => `<span class="ct-graph-nb">${escapeHtml(formatValue(n))}</span>`).join("")
+          : `<span class="ct-empty">no edges</span>`;
+        row.innerHTML = `<div class="ct-graph-node">${escapeHtml(formatValue(node))}</div>
+          <div class="ct-graph-edges">${nbHtml}</div>`;
+        grid.append(row);
+      });
+      card.append(grid);
+      content.append(card);
+    });
+
+    // Unknowns
+    containers.unknowns.forEach((unknown) => {
+      const card = createContainerCard(unknown.name, unknown.kind || "unknown", "unknown", frame.active);
+      const wrap = document.createElement("div");
+      wrap.className = "ct-unknown-wrap";
+      if (!unknown.values || !unknown.values.length) {
+        wrap.innerHTML = `<span class="ct-empty">empty or opaque</span>`;
+      } else {
+        unknown.values.forEach((v, i) => {
+          const cell = document.createElement("div");
+          cell.className = "ct-unknown-cell";
+          cell.innerHTML = `<div class="ct-idx">[${i}]</div><div class="ct-val">${escapeHtml(formatValue(v))}</div>`;
+          wrap.append(cell);
+        });
+      }
+      card.append(wrap);
+      content.append(card);
+    });
+
+    section.append(content);
+    dom.containersView.append(section);
   });
+
+  if (!hasAny) {
+    dom.containersView.innerHTML = `<div class="empty-state">Container-aware visuals show only when vector, deque, map, unordered_map, set, unordered_set, stack, queue, priority_queue, list, or graph data is available.</div>`;
+  }
 }
 
 function toggleVariable(frameId, name) {
@@ -870,12 +899,12 @@ function countContainers(containers) {
     + normalized.queues.length
     + normalized.priorityQueues.length
     + normalized.lists.length
-    + normalized.graphs.length;
+    + normalized.graphs.length
+    + normalized.unknowns.length;
 }
 
 function isCurrentFrameContainer(step, name) {
   const active = normalizeContainers(step?.activeContainers);
-
   return [
     ...active.arrays,
     ...active.maps,
@@ -884,7 +913,8 @@ function isCurrentFrameContainer(step, name) {
     ...active.queues,
     ...active.priorityQueues,
     ...active.lists,
-    ...active.graphs
+    ...active.graphs,
+    ...active.unknowns
   ].some((item) => item.name === name);
 }
 
@@ -916,6 +946,7 @@ function normalizeContainers(containers) {
     queues: containers?.queues || [],
     priorityQueues: containers?.priorityQueues || [],
     lists: containers?.lists || [],
-    graphs: containers?.graphs || []
+    graphs: containers?.graphs || [],
+    unknowns: containers?.unknowns || []
   };
 }

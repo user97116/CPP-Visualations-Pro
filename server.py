@@ -22,13 +22,14 @@ class TraceError(Exception):
     details: str = ""
     status: int = HTTPStatus.BAD_REQUEST
 
-# add this helper
+
 def make_frame_key(stack_frames: list[dict[str, Any]], depth: int) -> str:
     return " > ".join(
         f"{f['name']}@{f['line']}"
         for f in stack_frames[: depth + 1]
     )
-    
+
+
 class CppTracer:
     def __init__(self) -> None:
         compiler = shutil.which("clang++") or shutil.which("g++")
@@ -37,7 +38,6 @@ class CppTracer:
         if not shutil.which("lldb"):
             raise TraceError("LLDB is not installed.", status=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.compiler = compiler
-
 
     def trace(self, code: str) -> dict[str, Any]:
         if not code.strip():
@@ -92,24 +92,6 @@ class CppTracer:
         if result.returncode != 0:
             raise TraceError("Compilation failed.", details=(result.stderr or result.stdout).strip())
 
-    def _extract_stdout(self, raw_output: str) -> str:
-        noise = re.compile(
-            r'^(\(lldb\)|Process \d+|Breakpoint \d+|Current executable|Executing commands|Target \d+:'
-            r'|\* thread #|\s+frame #'
-            r'|\s*->\s+\d+\s'
-            r'|\s+\d+\s+\t'
-            r'|\s*\^'
-            r'|error:|warning:'
-            r')'
-        )
-        lines = [
-            line for line in raw_output.splitlines()
-            if TRACE_JSON_PREFIX not in line
-            and not noise.match(line)
-            and line.strip()
-        ]
-        return "\n".join(lines)
-
     def _run_lldb(self, binary_path: Path, source_path: Path, code: str) -> str:
         commands_path = binary_path.with_suffix(".lldb")
         helper_path = binary_path.with_suffix(".py")
@@ -122,13 +104,13 @@ class CppTracer:
         )
 
         try:
-          result = subprocess.run(
-              ["lldb", "-b", "-s", str(commands_path), "--", str(binary_path)],
-              capture_output=True,
-              text=True,
-              cwd=ROOT,
-              timeout=45
-          )
+            result = subprocess.run(
+                ["lldb", "-b", "-s", str(commands_path), "--", str(binary_path)],
+                capture_output=True,
+                text=True,
+                cwd=ROOT,
+                timeout=45
+            )
         except subprocess.TimeoutExpired as exc:
             raise TraceError("Tracing timed out.", details="The debugger did not finish within 45 seconds.") from exc
 
@@ -262,10 +244,8 @@ def emit_step(debugger, command, result, internal_dict):
                     raw_frame.get("line", current_line),
                     declaration_lines
                 )
-
                 args = raw_frame.get("args", [])
                 stack_frames[depth]["args"] = args
-                stack_frames[depth]["id"] = make_frame_key(stack_frames, depth)
                 stack_frames[depth]["locals"] = variables
                 stack_frames[depth]["containers"] = containers
                 stack_frames[depth]["memory"] = memory
@@ -273,46 +253,32 @@ def emit_step(debugger, command, result, internal_dict):
                 variables_by_depth[depth] = variables
                 containers_by_depth[depth] = containers
                 memory_by_depth[depth] = memory
-                
 
-            # Build stack payload ONCE per step, outside the raw_frames loop
-            stack_payload = []
             total_frames = len(stack_frames)
             for depth, frame in enumerate(stack_frames):
-                locals_payload = variables_by_depth.get(depth, [])
                 bottom_index = total_frames - 1 - depth
-                stack_payload.append(
-                    {
-                        "id": f"{frame['name']}|{bottom_index}",
-                        "name": frame["name"],
-                        "args": frame.get("args", []),
-                        "locals": locals_payload,
-                        "status": "active" if depth == 0 else "waiting",
-                        "active": depth == 0
-                    }
-                )
+                frame["id"] = f"{frame['name']}|{bottom_index}"
+                frame["status"] = "active" if depth == 0 else "waiting"
+                frame["active"] = depth == 0
 
-            top_containers = containers_by_depth.get(0, empty_containers())
-            merged_containers = merge_containers(containers_by_depth)
             merged_memory = merge_memory_graphs(memory_by_depth)
             line_text = code_lines[current_line - 1].strip() if current_line - 1 < len(code_lines) else ""
             function_name = stack_frames[0]["name"]
             event = describe_event(function_name, current_line, line_text)
-            summary = describe_summary(function_name, line_text, len(stack_payload), merged_containers)
-
+            merged_containers = merge_containers(containers_by_depth)
+            summary = describe_summary(function_name, line_text, len(stack_frames), merged_containers)
             top_frame = stack_frames[0]
-            steps.append(
-                {
-                    "line": current_line,
-                    "event": event,
-                    "summary": summary,
-                    "stdout": payload.get("stdout", "").rstrip(),
-                    "stack": stack_frames,
-                    "containers": top_frame.get("containers", empty_containers()),
-                    "activeContainers": top_frame.get("containers", empty_containers()),
-                    "memory": top_frame.get("memory", empty_memory_graph())
-                }
-            )
+
+            steps.append({
+                "line": current_line,
+                "event": event,
+                "summary": summary,
+                "stdout": payload.get("stdout", "").rstrip(),
+                "stack": stack_frames,
+                "containers": merged_containers,
+                "activeContainers": top_frame.get("containers", empty_containers()),
+                "memory": top_frame.get("memory", empty_memory_graph())
+            })
 
         return dedupe_consecutive_steps(steps)
 
@@ -321,17 +287,12 @@ def emit_step(debugger, command, result, internal_dict):
         for depth, frame in enumerate(raw_frames):
             function = frame.get("function", "<anonymous>")
             name, _ = split_function_signature(function)
-            args = []
-            signature = f"{name}|{depth}"
-            frames.append(
-                {
-                    "depth": depth,
-                    "name": name,
-                    "args": args,
-                    "signature": signature,
-                    "line": int(frame.get("line", 0))
-                }
-            )
+            frames.append({
+                "depth": depth,
+                "name": name,
+                "args": [],
+                "line": int(frame.get("line", 0))
+            })
         return frames
 
     def _mark_changed_values(self, steps: list[dict[str, Any]]) -> None:
@@ -351,8 +312,7 @@ def emit_step(debugger, command, result, internal_dict):
 
     def _carry_forward_containers(self, steps: list[dict[str, Any]]) -> None:
         last_seen: dict[str, dict[str, list[dict[str, Any]]]] = {}
-
-        kinds = ("arrays", "maps", "sets", "stacks", "queues", "priorityQueues", "lists", "graphs")
+        kinds = ("arrays", "maps", "sets", "stacks", "queues", "priorityQueues", "lists", "graphs", "unknowns")
 
         for step in steps:
             current_seen: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -367,6 +327,15 @@ def emit_step(debugger, command, result, internal_dict):
 
                 frame["containers"] = merged
                 current_seen[frame_id] = merged
+
+            step["containers"] = merge_containers(
+                {i: f["containers"] for i, f in enumerate(step["stack"])}
+            )
+            step["activeContainers"] = (
+                step["stack"][0].get("containers", empty_containers())
+                if step["stack"]
+                else empty_containers()
+            )
 
             last_seen = current_seen
 
@@ -389,38 +358,48 @@ def emit_step(debugger, command, result, internal_dict):
 
             last_seen = current_seen
 
-
     def _attach_flow_nodes(self, steps: list[dict[str, Any]]) -> None:
+        # Build a stable call tree across all steps.
+        # Key = function_name|depth_in_reversed_stack|call_id
+        # We use a monotonic call_id so every distinct activation gets its own node,
+        # which makes the recursion tree accurate and layout stable.
         seen_nodes: list[dict[str, Any]] = []
         seen_edges: list[dict[str, str]] = []
-        call_keys: set[str] = set()
+        node_index_by_key: dict[str, int] = {}
         edge_keys: set[str] = set()
+        call_counter = 0
 
         for step in steps:
-            active_keys = []
+            active_keys: list[str] = []
             path = list(reversed(step["stack"]))
+            step_nodes: list[str] = []
+
             for depth, frame in enumerate(path):
-                key = f"{frame['name']}|{' '.join(frame['args'])}|{depth}"
+                args = frame.get("args", []) or []
+                args_str = ", ".join(args)
+                # Use a stable key based on the call stack shape.
+                # For the same function at the same depth, if args changed we still
+                # treat it as the same logical node so the tree doesn't explode.
+                key = f"{frame['name']}:{depth}:{args_str}"
+                if key not in node_index_by_key:
+                    node_index_by_key[key] = len(seen_nodes)
+                    parent_key = active_keys[-1] if active_keys else None
+                    seen_nodes.append({
+                        "id": key,
+                        "label": format_flow_label(frame["name"], args),
+                        "function": frame["name"],
+                        "params": args,
+                        "meta": f"line {step['line']}",
+                        "depth": depth,
+                        "parentId": parent_key
+                    })
+                    if parent_key is not None:
+                        edge_key = f"{parent_key}→{key}"
+                        if edge_key not in edge_keys:
+                            edge_keys.add(edge_key)
+                            seen_edges.append({"from": parent_key, "to": key})
+                step_nodes.append(key)
                 active_keys.append(key)
-                parent_id = active_keys[depth - 1] if depth > 0 else None
-                if key not in call_keys:
-                    call_keys.add(key)
-                    seen_nodes.append(
-                        {
-                            "id": key,
-                            "label": format_flow_label(frame["name"], frame["args"]),
-                            "function": frame["name"],
-                            "params": frame["args"],
-                            "meta": f"line {step['line']}",
-                            "depth": depth,
-                            "parentId": parent_id
-                        }
-                    )
-                if parent_id:
-                    edge_key = f"{parent_id}->{key}"
-                    if edge_key not in edge_keys:
-                        edge_keys.add(edge_key)
-                        seen_edges.append({"from": parent_id, "to": key})
 
             step["tree"] = {
                 "nodes": [
@@ -457,10 +436,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         except TraceError as exc:
             self._send_json(
                 exc.status,
-                {
-                    "error": exc.message,
-                    "details": exc.details
-                }
+                {"error": exc.message, "details": exc.details}
             )
         except Exception as exc:
             self._send_json(
@@ -489,7 +465,8 @@ def empty_containers() -> dict[str, list[dict[str, Any]]]:
         "queues": [],
         "priorityQueues": [],
         "lists": [],
-        "graphs": []
+        "graphs": [],
+        "unknowns": []
     }
 
 
@@ -538,12 +515,13 @@ def merge_containers(
         "queues": set(),
         "priorityQueues": set(),
         "lists": set(),
-        "graphs": set()
+        "graphs": set(),
+        "unknowns": set()
     }
 
     for depth in sorted(containers_by_depth):
         containers = containers_by_depth[depth]
-        for kind in ("arrays", "maps", "sets", "stacks", "queues", "priorityQueues", "lists", "graphs"):
+        for kind in ("arrays", "maps", "sets", "stacks", "queues", "priorityQueues", "lists", "graphs", "unknowns"):
             for item in containers.get(kind, []):
                 key = item.get("name")
                 if key in seen[kind]:
@@ -583,7 +561,8 @@ def dedupe_consecutive_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]
             json.dumps(step["stack"], sort_keys=True),
             json.dumps(step["containers"], sort_keys=True)
         )
-        deduped.append(step)
+        if signature != previous_signature:
+            deduped.append(step)
         previous_signature = signature
 
     return deduped
@@ -776,6 +755,22 @@ def parse_frame_variables(
                 index = next_index
                 continue
 
+        if (typename.startswith("std::") or "<" in typename) and (value_text.startswith("size=") or value_text == "{"):
+            if value_text.startswith("size="):
+                values, next_index = parse_set(rows, index)
+                if values is not None:
+                    containers["unknowns"].append({"name": name, "kind": typename, "values": values})
+                    variables.append({"name": name, "value": values})
+                    index = next_index
+                    continue
+            if value_text == "{":
+                values, next_index = parse_indexed_block(rows, index)
+                if values is not None:
+                    containers["unknowns"].append({"name": name, "kind": typename, "values": values})
+                    variables.append({"name": name, "value": values})
+                    index = next_index
+                    continue
+
         if value_text.endswith("{"):
             index += 1
             while index < len(rows) and rows[index].strip() != "}":
@@ -804,7 +799,7 @@ def parse_vector(rows: list[str], start_index: int) -> tuple[list[Any] | None, i
     while index < len(rows):
         line = rows[index].strip()
         if line == "}":
-          return values, index + 1
+            return values, index + 1
         nested_match = re.match(r"^\[(\d+)\]\s*=\s*size=\d+\s*\{$", line)
         if nested_match:
             nested_values, next_index = parse_nested_size_block(rows, index)
@@ -1076,13 +1071,11 @@ def parse_pointer_object_block(
             member_name = pointer_member.group(2)
             target_address = normalize_address(pointer_member.group(3))
             if target_address:
-                edges.append(
-                    {
-                        "from": owner_address,
-                        "to": target_address,
-                        "label": member_name
-                    }
-                )
+                edges.append({
+                    "from": owner_address,
+                    "to": target_address,
+                    "label": member_name
+                })
         index += 1
     return edges, index
 
@@ -1244,6 +1237,7 @@ def describe_summary(
         or containers["priorityQueues"]
         or containers["lists"]
         or containers["graphs"]
+        or containers["unknowns"]
     ):
         parts.append("Container views were captured directly from the current frame.")
     else:
