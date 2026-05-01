@@ -1,0 +1,1128 @@
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+MAX_TRACE_STEPS = 160
+TRACE_JSON_PREFIX = "__CODEX_JSON__"
+
+
+@dataclass
+class TraceError(Exception):
+    message: str
+    details: str = ""
+    status: int = HTTPStatus.BAD_REQUEST
+
+
+class CppTracer:
+    def __init__(self) -> None:
+        compiler = shutil.which("clang++") or shutil.which("g++")
+        if not compiler:
+            raise TraceError("No C++ compiler found.", status=HTTPStatus.INTERNAL_SERVER_ERROR)
+        if not shutil.which("lldb"):
+            raise TraceError("LLDB is not installed.", status=HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.compiler = compiler
+
+    def trace(self, code: str) -> dict[str, Any]:
+        if not code.strip():
+            raise TraceError("Paste some C++ code first.")
+
+        with tempfile.TemporaryDirectory(prefix="cpp-flow-") as temp_dir:
+            workspace = Path(temp_dir)
+            source_path = workspace / "program.cpp"
+            binary_path = workspace / "program"
+            source_path.write_text(code, encoding="utf-8")
+
+            self._compile(source_path, binary_path)
+            raw_output = self._run_lldb(binary_path, source_path, code)
+            steps = self._parse_steps(raw_output, code, source_path.name)
+            if not steps:
+                raise TraceError(
+                    "The program compiled, but no executable source-line trace was captured.",
+                    details="Try code with a `main()` function and executable statements."
+                )
+
+            self._carry_forward_containers(steps)
+            self._mark_changed_values(steps)
+            self._attach_flow_nodes(steps)
+
+            return {
+                "title": "Real LLDB trace",
+                "code": code,
+                "steps": steps
+            }
+
+    def _compile(self, source_path: Path, binary_path: Path) -> None:
+        result = subprocess.run(
+            [
+                self.compiler,
+                "-std=c++17",
+                "-O0",
+                "-g",
+                "-fno-inline",
+                str(source_path),
+                "-o",
+                str(binary_path)
+            ],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            timeout=30
+        )
+        if result.returncode != 0:
+            raise TraceError("Compilation failed.", details=(result.stderr or result.stdout).strip())
+
+    def _run_lldb(self, binary_path: Path, source_path: Path, code: str) -> str:
+        commands_path = binary_path.with_suffix(".lldb")
+        helper_path = binary_path.with_suffix(".py")
+        helper_path.write_text(self._build_lldb_helper(), encoding="utf-8")
+        commands_path.write_text(
+            self._build_lldb_script(source_path, code, helper_path),
+            encoding="utf-8"
+        )
+
+        try:
+          result = subprocess.run(
+              ["lldb", "-b", "-s", str(commands_path), "--", str(binary_path)],
+              capture_output=True,
+              text=True,
+              cwd=ROOT,
+              timeout=45
+          )
+        except subprocess.TimeoutExpired as exc:
+            raise TraceError("Tracing timed out.", details="The debugger did not finish within 45 seconds.") from exc
+
+        return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+
+    def _build_lldb_script(self, source_path: Path, code: str, helper_path: Path) -> str:
+        lines = code.splitlines()
+        commands = [
+            f"command script import {helper_path}",
+            "settings set target.max-children-count 32"
+        ]
+
+        for line_number, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if not stripped or stripped in {"{", "}"}:
+                continue
+            if stripped.startswith("#") or stripped.startswith("//"):
+                continue
+            commands.append(f"breakpoint set --file {source_path.name} --line {line_number}")
+
+        commands.append("run")
+
+        for _ in range(MAX_TRACE_STEPS):
+            commands.append(f"codex-step {source_path.name}")
+            commands.append("continue")
+
+        return "\n".join(commands) + "\n"
+
+    def _build_lldb_helper(self) -> str:
+        return f"""
+import json
+import lldb
+
+TRACE_PREFIX = {TRACE_JSON_PREFIX!r}
+
+def __lldb_init_module(debugger, internal_dict):
+    debugger.HandleCommand('command script add -f ' + __name__ + '.emit_step codex-step')
+
+def emit_step(debugger, command, result, internal_dict):
+    source_name = command.strip()
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
+    thread = process.GetSelectedThread()
+
+    if not process.IsValid() or not thread.IsValid():
+        result.Print(TRACE_PREFIX + json.dumps({{'invalid': True}}))
+        return
+
+    current_frame = thread.GetFrameAtIndex(0)
+    current_line_entry = current_frame.GetLineEntry()
+    current_file = current_line_entry.GetFileSpec().GetFilename() if current_line_entry.IsValid() else ''
+    current_line = current_line_entry.GetLine() if current_line_entry.IsValid() else 0
+
+    payload = {{
+        'file': current_file,
+        'line': current_line,
+        'frames': []
+    }}
+
+    interpreter = debugger.GetCommandInterpreter()
+    select_result = lldb.SBCommandReturnObject()
+    vars_result = lldb.SBCommandReturnObject()
+
+    for index in range(thread.GetNumFrames()):
+        frame = thread.GetFrameAtIndex(index)
+        line_entry = frame.GetLineEntry()
+        if not line_entry.IsValid():
+            continue
+        file_spec = line_entry.GetFileSpec()
+        if file_spec.GetFilename() != source_name:
+            continue
+
+        function_name = frame.GetFunctionName() or frame.GetDisplayFunctionName() or frame.GetName() or '<anonymous>'
+        select_result.Clear()
+        vars_result.Clear()
+        interpreter.HandleCommand(f'frame select {{index}}', select_result)
+        interpreter.HandleCommand('frame variable', vars_result)
+        payload['frames'].append({{
+            'index': index,
+            'function': function_name,
+            'line': line_entry.GetLine(),
+            'vars_raw': vars_result.GetOutput() or ''
+        }})
+
+    interpreter.HandleCommand('frame select 0', select_result)
+    result.Print(TRACE_PREFIX + json.dumps(payload))
+"""
+
+    def _parse_steps(self, raw_output: str, code: str, source_name: str) -> list[dict[str, Any]]:
+        declaration_lines = find_declaration_lines(code)
+        code_lines = code.splitlines()
+        steps: list[dict[str, Any]] = []
+
+        for line in raw_output.splitlines():
+            if TRACE_JSON_PREFIX not in line:
+                continue
+            payload = json.loads(line.split(TRACE_JSON_PREFIX, 1)[1].strip())
+            if payload.get("invalid") or payload.get("file") != source_name:
+                continue
+
+            current_line = int(payload["line"])
+            raw_frames = payload.get("frames", [])
+            stack_frames = self._parse_stack_frames(raw_frames)
+            if not stack_frames:
+                continue
+
+            variables_by_depth: dict[int, list[dict[str, Any]]] = {}
+            containers_by_depth: dict[int, dict[str, list[dict[str, Any]]]] = {}
+            memory_by_depth: dict[int, dict[str, list[dict[str, str]]]] = {}
+            for depth, raw_frame in enumerate(raw_frames):
+                variables, containers, memory = parse_frame_variables(
+                    raw_frame.get("vars_raw", ""),
+                    raw_frame.get("line", current_line),
+                    declaration_lines
+                )
+                if depth == 0:
+                    variables_by_depth[depth] = variables
+                containers_by_depth[depth] = containers
+                memory_by_depth[depth] = memory
+
+            stack_payload = []
+            for depth, frame in enumerate(stack_frames):
+                locals_payload = variables_by_depth.get(depth, [])
+                stack_payload.append(
+                    {
+                        "id": f"{frame['name']}|{depth}|{frame['signature']}",
+                        "name": frame["name"],
+                        "args": frame["args"],
+                        "locals": locals_payload,
+                        "status": "active" if depth == 0 else "waiting",
+                        "active": depth == 0
+                    }
+                )
+
+            top_containers = containers_by_depth.get(0, empty_containers())
+            merged_containers = merge_containers(containers_by_depth)
+            merged_memory = merge_memory_graphs(memory_by_depth)
+            line_text = code_lines[current_line - 1].strip() if current_line - 1 < len(code_lines) else ""
+            function_name = stack_frames[0]["name"]
+            event = describe_event(function_name, current_line, line_text)
+            summary = describe_summary(function_name, line_text, len(stack_payload), merged_containers)
+
+            steps.append(
+                {
+                    "line": current_line,
+                    "event": event,
+                    "summary": summary,
+                    "stack": stack_payload,
+                    "containers": merged_containers,
+                    "activeContainers": top_containers,
+                    "memory": merged_memory
+                }
+            )
+
+        return dedupe_consecutive_steps(steps)
+
+    def _parse_stack_frames(self, raw_frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        frames = []
+        for depth, frame in enumerate(raw_frames):
+            function = frame.get("function", "<anonymous>")
+            name, args = split_function_signature(function)
+            signature = f"{name}|{args}|{frame.get('line', 0)}"
+            frames.append(
+                {
+                    "depth": depth,
+                    "name": name,
+                    "args": args,
+                    "signature": signature,
+                    "line": int(frame.get("line", 0))
+                }
+            )
+        return frames
+
+    def _mark_changed_values(self, steps: list[dict[str, Any]]) -> None:
+        previous_values: dict[str, dict[str, Any]] = {}
+
+        for step in steps:
+            current_values: dict[str, dict[str, Any]] = {}
+            for frame in step["stack"]:
+                frame_values = previous_values.get(frame["id"], {})
+                next_values: dict[str, Any] = {}
+                for variable in frame["locals"]:
+                    key = variable["name"]
+                    variable["changed"] = frame_values.get(key) != variable["value"]
+                    next_values[key] = variable["value"]
+                current_values[frame["id"]] = next_values
+            previous_values = current_values
+
+    def _carry_forward_containers(self, steps: list[dict[str, Any]]) -> None:
+        last_seen = empty_containers()
+
+        for step in steps:
+            merged = empty_containers()
+            current = step.get("containers", empty_containers())
+
+            for kind in ("arrays", "maps", "sets", "stacks", "queues", "priorityQueues", "lists", "graphs"):
+                current_items = current.get(kind, [])
+                if current_items:
+                    last_seen[kind] = current_items
+                merged[kind] = last_seen[kind]
+
+            step["containers"] = merged
+
+    def _attach_flow_nodes(self, steps: list[dict[str, Any]]) -> None:
+        seen_nodes: list[dict[str, Any]] = []
+        seen_edges: list[dict[str, str]] = []
+        call_keys: set[str] = set()
+        edge_keys: set[str] = set()
+
+        for step in steps:
+            active_keys = []
+            path = list(reversed(step["stack"]))
+            for depth, frame in enumerate(path):
+                key = f"{frame['name']}|{' '.join(frame['args'])}|{depth}"
+                active_keys.append(key)
+                parent_id = active_keys[depth - 1] if depth > 0 else None
+                if key not in call_keys:
+                    call_keys.add(key)
+                    seen_nodes.append(
+                        {
+                            "id": key,
+                            "label": format_flow_label(frame["name"], frame["args"]),
+                            "function": frame["name"],
+                            "params": frame["args"],
+                            "meta": f"line {step['line']}",
+                            "depth": depth,
+                            "parentId": parent_id
+                        }
+                    )
+                if parent_id:
+                    edge_key = f"{parent_id}->{key}"
+                    if edge_key not in edge_keys:
+                        edge_keys.add(edge_key)
+                        seen_edges.append({"from": parent_id, "to": key})
+
+            step["tree"] = {
+                "nodes": [
+                    {
+                        **node,
+                        "active": node["id"] == active_keys[-1] if active_keys else False,
+                        "done": node["id"] not in active_keys
+                    }
+                    for node in seen_nodes
+                ],
+                "edges": [*seen_edges]
+            }
+
+
+class AppHandler(SimpleHTTPRequestHandler):
+    tracer = CppTracer()
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def do_POST(self) -> None:
+        if self.path != "/api/trace":
+            self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            code = payload.get("code", "")
+            trace = self.tracer.trace(code)
+            self._send_json(HTTPStatus.OK, trace)
+        except json.JSONDecodeError:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON payload."})
+        except TraceError as exc:
+            self._send_json(
+                exc.status,
+                {
+                    "error": exc.message,
+                    "details": exc.details
+                }
+            )
+        except Exception as exc:  # pragma: no cover - safety net for local tool usage
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": "Unexpected tracing failure.", "details": str(exc)}
+            )
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+def empty_containers() -> dict[str, list[dict[str, Any]]]:
+    return {
+        "arrays": [],
+        "maps": [],
+        "sets": [],
+        "stacks": [],
+        "queues": [],
+        "priorityQueues": [],
+        "lists": [],
+        "graphs": []
+    }
+
+
+def empty_memory_graph() -> dict[str, list[dict[str, str]]]:
+    return {"nodes": [], "edges": []}
+
+
+def merge_memory_graphs(
+    memory_by_depth: dict[int, dict[str, list[dict[str, str]]]]
+) -> dict[str, list[dict[str, str]]]:
+    merged = empty_memory_graph()
+    seen_nodes: set[str] = set()
+    seen_edges: set[str] = set()
+
+    for depth in sorted(memory_by_depth):
+        graph = memory_by_depth[depth]
+        for node in graph.get("nodes", []):
+            node_id = node.get("id")
+            if not node_id or node_id in seen_nodes:
+                continue
+            seen_nodes.add(node_id)
+            merged["nodes"].append(node)
+        for edge in graph.get("edges", []):
+            source = edge.get("from")
+            target = edge.get("to")
+            if not source or not target:
+                continue
+            key = f"{source}->{target}|{edge.get('label', '')}"
+            if key in seen_edges:
+                continue
+            seen_edges.add(key)
+            merged["edges"].append(edge)
+
+    return merged
+
+
+def merge_containers(
+    containers_by_depth: dict[int, dict[str, list[dict[str, Any]]]]
+) -> dict[str, list[dict[str, Any]]]:
+    merged = empty_containers()
+    seen = {
+        "arrays": set(),
+        "maps": set(),
+        "sets": set(),
+        "stacks": set(),
+        "queues": set(),
+        "priorityQueues": set(),
+        "lists": set(),
+        "graphs": set()
+    }
+
+    for depth in sorted(containers_by_depth):
+        containers = containers_by_depth[depth]
+        for kind in ("arrays", "maps", "sets", "stacks", "queues", "priorityQueues", "lists", "graphs"):
+            for item in containers.get(kind, []):
+                key = item.get("name")
+                if key in seen[kind]:
+                    continue
+                seen[kind].add(key)
+                merged[kind].append(item)
+
+    return merged
+
+
+def format_flow_label(name: str, args: list[str]) -> str:
+    return f"{name}({', '.join(args)})" if args else f"{name}()"
+
+
+def split_function_signature(raw: str) -> tuple[str, list[str]]:
+    match = re.match(r"^(?P<name>[^(]+)(?P<args>\(.*\))$", raw.strip())
+    if not match:
+        return raw.strip(), []
+
+    name = match.group("name").strip()
+    inner = match.group("args")[1:-1].strip()
+    if not inner:
+        return name, []
+    args = [item.strip().replace("=", " = ") for item in inner.split(",")]
+    if not any("=" in item for item in args):
+        return name, []
+    return name, args
+
+
+def dedupe_consecutive_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped = []
+    previous_signature = None
+
+    for step in steps:
+        signature = (
+            step["line"],
+            json.dumps(step["stack"], sort_keys=True),
+            json.dumps(step["containers"], sort_keys=True)
+        )
+        if signature == previous_signature:
+            continue
+        deduped.append(step)
+        previous_signature = signature
+
+    return deduped
+
+
+def find_declaration_lines(code: str) -> dict[str, int]:
+    declarations: dict[str, int] = {}
+    pattern = re.compile(
+        r"(?:^|\s)(?:const\s+)?(?:std::\w+(?:<[^;]+>)?|\w+(?:<[^;]+>)?|unsigned|signed|long long|long|int|double|float|char|bool|string)\s+([A-Za-z_]\w*)"
+    )
+
+    for line_number, line in enumerate(code.splitlines(), start=1):
+        for match in pattern.finditer(line):
+            declarations.setdefault(match.group(1), line_number)
+
+    return declarations
+
+
+def parse_frame_variables(
+    text: str,
+    current_line: int,
+    declaration_lines: dict[str, int]
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]], dict[str, list[dict[str, str]]]]:
+    rows = [
+        line.strip("\n")
+        for line in text.splitlines()
+        if line.strip() and not line.startswith("(lldb)") and "frame #0:" not in line and "frame #1:" not in line
+    ]
+
+    variables: list[dict[str, Any]] = []
+    containers = empty_containers()
+    memory = empty_memory_graph()
+    index = 0
+
+    while index < len(rows):
+        row = rows[index].strip()
+        start = re.match(r"^\(([^)]+)\)\s+([A-Za-z_]\w*)\s*=\s*(.+)$", row)
+        if not start:
+            index += 1
+            continue
+
+        typename = start.group(1)
+        name = start.group(2)
+        value_text = start.group(3)
+        declaration_line = declaration_lines.get(name, -1)
+        if declaration_line > current_line:
+            index += 1
+            if value_text.endswith("{"):
+                while index < len(rows) and rows[index].strip() != "}":
+                    index += 1
+                index += 1
+            continue
+
+        if is_map_type(typename) and value_text.startswith("size="):
+            entries, next_index = parse_map(rows, index)
+            if entries is not None:
+                if is_graph_adjacency_map(entries):
+                    containers["graphs"].append({"name": name, "edges": entries})
+                else:
+                    containers["maps"].append({"name": name, "entries": entries})
+                variables.append({"name": name, "value": dict(entries)})
+                index = next_index
+                continue
+
+        if is_vector_type(typename) and value_text.startswith("size="):
+            values, next_index = parse_vector(rows, index)
+            if values is not None:
+                if is_graph_adjacency_list(values):
+                    containers["graphs"].append({"name": name, "edges": [[i, value] for i, value in enumerate(values)]})
+                else:
+                    containers["arrays"].append({"name": name, "kind": "vector", "values": values})
+                variables.append({"name": name, "value": values})
+                index = next_index
+                continue
+
+        if is_set_type(typename) and value_text.startswith("size="):
+            values, next_index = parse_set(rows, index)
+            if values is not None:
+                containers["sets"].append({"name": name, "values": values})
+                variables.append({"name": name, "value": values})
+                index = next_index
+                continue
+
+        if is_stack_type(typename) and value_text == "{":
+            values, next_index = parse_stack(rows, index)
+            if values is not None:
+                containers["stacks"].append({"name": name, "values": values})
+                variables.append({"name": name, "value": values})
+                index = next_index
+                continue
+
+        if is_list_type(typename) and value_text.startswith("size="):
+            values, next_index = parse_list(rows, index)
+            if values is not None:
+                containers["lists"].append({"name": name, "values": values})
+                variables.append({"name": name, "value": values})
+                index = next_index
+                continue
+
+        if is_deque_type(typename) and value_text.startswith("size="):
+            values, next_index = parse_deque(rows, index)
+            if values is not None:
+                containers["arrays"].append({"name": name, "kind": "deque", "values": values})
+                variables.append({"name": name, "value": values})
+                index = next_index
+                continue
+
+        if is_queue_type(typename):
+            values, next_index = parse_queue(rows, index)
+            if values is not None:
+                containers["queues"].append({"name": name, "values": values})
+                variables.append({"name": name, "value": values})
+                index = next_index
+                continue
+
+        if is_priority_queue_type(typename):
+            values, next_index = parse_priority_queue(rows, index)
+            if values is not None:
+                containers["priorityQueues"].append({"name": name, "values": values})
+                variables.append({"name": name, "value": values})
+                index = next_index
+                continue
+
+        if is_vector_array_type(typename) and value_text == "{":
+            values, next_index = parse_vector_array(rows, index)
+            if values is not None:
+                containers["graphs"].append({"name": name, "edges": [[i, value] for i, value in enumerate(values)]})
+                variables.append({"name": name, "value": values})
+                index = next_index
+                continue
+
+        if is_pointer_type(typename):
+            variable_id = f"var:{name}"
+            add_memory_node(memory, variable_id, name, "variable")
+            address = normalize_address(extract_address(value_text))
+            if address:
+                add_memory_node(memory, address, address, "address")
+                add_memory_edge(memory, variable_id, address, "points")
+                variables.append({"name": name, "value": address})
+            elif value_text.strip() in {"nullptr", "null", "0x0"}:
+                variables.append({"name": name, "value": "nullptr"})
+            if value_text.endswith("{") and address:
+                pointer_edges, next_index = parse_pointer_object_block(rows, index, address)
+                for edge in pointer_edges:
+                    add_memory_node(memory, edge["to"], edge["to"], "address")
+                    add_memory_edge(memory, edge["from"], edge["to"], edge["label"])
+                index = next_index
+                continue
+
+        if value_text.endswith("{"):
+            index += 1
+            while index < len(rows) and rows[index].strip() != "}":
+                index += 1
+            index += 1
+            continue
+
+        parsed_value = parse_literal(value_text)
+        variables.append({"name": name, "value": parsed_value})
+        index += 1
+
+    return variables, containers, memory
+
+
+def parse_vector(rows: list[str], start_index: int) -> tuple[list[Any] | None, int]:
+    size_match = re.search(r"size=(\d+)", rows[start_index])
+    if not size_match:
+        return None, start_index + 1
+
+    size = int(size_match.group(1))
+    if size > 2048:
+        return None, scan_to_block_end(rows, start_index)
+
+    values = []
+    index = start_index + 1
+    while index < len(rows):
+        line = rows[index].strip()
+        if line == "}":
+          return values, index + 1
+        nested_match = re.match(r"^\[(\d+)\]\s*=\s*size=\d+\s*\{$", line)
+        if nested_match:
+            nested_values, next_index = parse_nested_size_block(rows, index)
+            values.append(nested_values)
+            index = next_index
+            continue
+        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        if value_match:
+            values.append(parse_literal(value_match.group(2)))
+        index += 1
+
+    return values, index
+
+
+def parse_vector_array(rows: list[str], start_index: int) -> tuple[list[list[Any]] | None, int]:
+    adjacency: list[list[Any]] = []
+    index = start_index + 1
+    while index < len(rows):
+        line = rows[index].strip()
+        if line == "}":
+            return adjacency, index + 1
+
+        nested_match = re.match(r"^\[(\d+)\]\s*=\s*size=\d+\s*\{$", line)
+        if nested_match:
+            values, next_index = parse_nested_size_block(rows, index)
+            adjacency.append(values)
+            index = next_index
+            continue
+
+        simple_match = re.match(r"^\[(\d+)\]\s*=\s*\{$", line)
+        if simple_match:
+            values, next_index = parse_indexed_block(rows, index)
+            adjacency.append(values)
+            index = next_index
+            continue
+
+        index += 1
+
+    return adjacency, index
+
+
+def parse_map(rows: list[str], start_index: int) -> tuple[list[list[Any]] | None, int]:
+    size_match = re.search(r"size=(\d+)", rows[start_index])
+    if not size_match:
+        return None, start_index + 1
+
+    size = int(size_match.group(1))
+    if size > 512:
+        return None, scan_to_block_end(rows, start_index)
+
+    entries: list[list[Any]] = []
+    index = start_index + 1
+    while index < len(rows):
+        line = rows[index].strip()
+        if line == "}":
+            return entries, index + 1
+        entry_match = re.match(r'^\[(\d+)\]\s*=\s*\(first = (.+), second = (.+)\)$', line)
+        if entry_match:
+            second = entry_match.group(3)
+            entries.append([parse_literal(entry_match.group(2)), parse_literal(second)])
+        elif re.match(r'^\[(\d+)\]\s*=\s*\{$', line):
+            key = None
+            value: Any = None
+            index += 1
+            while index < len(rows):
+                inner = rows[index].strip()
+                if inner == "}":
+                    break
+                if inner.startswith("first = "):
+                    key = parse_literal(inner.split("=", 1)[1].strip())
+                elif re.match(r"^second = size=\d+\s*\{$", inner):
+                    value, index = parse_named_size_block(rows, index)
+                    continue
+                elif inner.startswith("second = "):
+                    value = parse_literal(inner.split("=", 1)[1].strip())
+                index += 1
+            entries.append([key, value])
+        index += 1
+
+    return entries, index
+
+
+def parse_set(rows: list[str], start_index: int) -> tuple[list[Any] | None, int]:
+    size_match = re.search(r"size=(\d+)", rows[start_index])
+    if not size_match:
+        return None, start_index + 1
+
+    size = int(size_match.group(1))
+    if size > 2048:
+        return None, scan_to_block_end(rows, start_index)
+
+    values = []
+    index = start_index + 1
+    while index < len(rows):
+        line = rows[index].strip()
+        if line == "}":
+            return values, index + 1
+        entry_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        if entry_match:
+            values.append(parse_literal(entry_match.group(2)))
+        index += 1
+
+    return values, index
+
+
+def parse_deque(rows: list[str], start_index: int) -> tuple[list[Any] | None, int]:
+    return parse_set(rows, start_index)
+
+
+def parse_list(rows: list[str], start_index: int) -> tuple[list[Any] | None, int]:
+    values = []
+    index = start_index + 1
+    while index < len(rows):
+        line = rows[index].strip()
+        if line == "}":
+            return values, index + 1
+        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        if value_match:
+            values.append(parse_literal(value_match.group(2)))
+        index += 1
+    return values, index
+
+
+def parse_stack(rows: list[str], start_index: int) -> tuple[list[Any] | None, int]:
+    values = []
+    index = start_index + 1
+    inside_storage = False
+
+    while index < len(rows):
+        line = rows[index].strip()
+        if line.startswith("c = size="):
+            inside_storage = True
+            index += 1
+            continue
+        if line == "}" and inside_storage:
+            inside_storage = False
+            index += 1
+            continue
+        if line == "}":
+            return values, index + 1
+
+        entry_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        if entry_match:
+            values.append(parse_literal(entry_match.group(2)))
+
+        index += 1
+
+    return values, index
+
+
+def parse_queue(rows: list[str], start_index: int) -> tuple[list[Any] | None, int]:
+    values = []
+    index = start_index + 1
+    inside_storage = False
+
+    while index < len(rows):
+        line = rows[index].strip()
+        if line.startswith("c = size="):
+            inside_storage = True
+            index += 1
+            continue
+        if line == "}" and inside_storage:
+            inside_storage = False
+            index += 1
+            continue
+        if line == "}":
+            return values, index + 1
+
+        entry_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        if entry_match:
+            values.append(parse_literal(entry_match.group(2)))
+        index += 1
+
+    return values, index
+
+
+def parse_priority_queue(rows: list[str], start_index: int) -> tuple[list[Any] | None, int]:
+    values, next_index = parse_queue(rows, start_index)
+    if values is None:
+        return None, next_index
+    return sorted(values, reverse=True), next_index
+
+
+def parse_nested_size_block(rows: list[str], start_index: int) -> tuple[list[Any], int]:
+    values = []
+    index = start_index + 1
+    while index < len(rows):
+        line = rows[index].strip()
+        if line == "}":
+            return values, index + 1
+        nested_match = re.match(r"^\[(\d+)\]\s*=\s*size=\d+\s*\{$", line)
+        if nested_match:
+            nested_values, next_index = parse_nested_size_block(rows, index)
+            values.append(nested_values)
+            index = next_index
+            continue
+        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        if value_match:
+            values.append(parse_literal(value_match.group(2)))
+        index += 1
+    return values, index
+
+
+def parse_indexed_block(rows: list[str], start_index: int) -> tuple[list[Any], int]:
+    values = []
+    index = start_index + 1
+    while index < len(rows):
+        line = rows[index].strip()
+        if line == "}":
+            return values, index + 1
+        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        if value_match:
+            values.append(parse_literal(value_match.group(2)))
+        index += 1
+    return values, index
+
+
+def parse_named_size_block(rows: list[str], start_index: int) -> tuple[list[Any], int]:
+    values = []
+    index = start_index + 1
+    while index < len(rows):
+        line = rows[index].strip()
+        if line == "}":
+            return values, index + 1
+        nested_match = re.match(r"^\[(\d+)\]\s*=\s*size=\d+\s*\{$", line)
+        if nested_match:
+            nested_values, next_index = parse_nested_size_block(rows, index)
+            values.append(nested_values)
+            index = next_index
+            continue
+        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        if value_match:
+            values.append(parse_literal(value_match.group(2)))
+        index += 1
+    return values, index
+
+
+def scan_to_block_end(rows: list[str], start_index: int) -> int:
+    index = start_index + 1
+    while index < len(rows) and rows[index].strip() != "}":
+        index += 1
+    return index + 1
+
+
+def parse_pointer_object_block(
+    rows: list[str],
+    start_index: int,
+    owner_address: str
+) -> tuple[list[dict[str, str]], int]:
+    edges: list[dict[str, str]] = []
+    index = start_index + 1
+    depth = 1
+    while index < len(rows):
+        line = rows[index].strip()
+        if line.endswith("{"):
+            depth += 1
+        if line == "}":
+            depth -= 1
+            index += 1
+            if depth <= 0:
+                return edges, index
+            continue
+
+        pointer_member = re.match(
+            r"^(?:\(([^)]+)\)\s+)?([A-Za-z_]\w*)\s*=\s*(0x[0-9a-fA-F]+|nullptr|null|0x0).*$",
+            line
+        )
+        if pointer_member:
+            member_name = pointer_member.group(2)
+            target_address = normalize_address(pointer_member.group(3))
+            if target_address:
+                edges.append(
+                    {
+                        "from": owner_address,
+                        "to": target_address,
+                        "label": member_name
+                    }
+                )
+        index += 1
+    return edges, index
+
+
+def is_vector_type(typename: str) -> bool:
+    return "std::vector" in typename or typename.startswith("vector<")
+
+
+def is_vector_array_type(typename: str) -> bool:
+    return is_vector_type(typename) and "[" in typename and "]" in typename
+
+
+def is_map_type(typename: str) -> bool:
+    return (
+        "std::map" in typename
+        or "std::unordered_map" in typename
+        or typename.startswith("map<")
+        or typename.startswith("unordered_map<")
+    )
+
+
+def is_set_type(typename: str) -> bool:
+    return (
+        "std::set" in typename
+        or "std::unordered_set" in typename
+        or typename.startswith("set<")
+        or typename.startswith("unordered_set<")
+    )
+
+
+def is_stack_type(typename: str) -> bool:
+    return "std::stack" in typename or typename.startswith("stack<")
+
+
+def is_list_type(typename: str) -> bool:
+    return "std::list" in typename or typename.startswith("list<")
+
+
+def is_deque_type(typename: str) -> bool:
+    return "std::deque" in typename or typename.startswith("deque<")
+
+
+def is_queue_type(typename: str) -> bool:
+    return "std::queue" in typename or typename.startswith("queue<")
+
+
+def is_priority_queue_type(typename: str) -> bool:
+    return "std::priority_queue" in typename or typename.startswith("priority_queue<")
+
+
+def is_pointer_type(typename: str) -> bool:
+    return "*" in typename
+
+
+def is_graph_adjacency_list(values: list[Any]) -> bool:
+    return bool(values) and all(isinstance(item, list) for item in values)
+
+
+def is_graph_adjacency_map(entries: list[list[Any]]) -> bool:
+    return bool(entries) and all(len(item) == 2 and isinstance(item[1], list) for item in entries)
+
+
+def parse_literal(raw: str) -> Any:
+    value = raw.strip()
+    if value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    if re.fullmatch(r"-?\d+", value):
+        return int(value)
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        return float(value)
+    if value in {"true", "false"}:
+        return value == "true"
+    return value
+
+
+def extract_address(value_text: str) -> str | None:
+    match = re.search(r"0x[0-9a-fA-F]+", value_text)
+    return match.group(0) if match else None
+
+
+def normalize_address(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"0x0", "nullptr", "null"}:
+        return None
+    if normalized.startswith("0x"):
+        body = normalized[2:].lstrip("0")
+        normalized = f"0x{body or '0'}"
+        if normalized == "0x0":
+            return None
+    return normalized
+
+
+def add_memory_node(
+    memory: dict[str, list[dict[str, str]]],
+    node_id: str,
+    label: str,
+    kind: str
+) -> None:
+    if any(node.get("id") == node_id for node in memory["nodes"]):
+        return
+    memory["nodes"].append({"id": node_id, "label": label, "kind": kind})
+
+
+def add_memory_edge(
+    memory: dict[str, list[dict[str, str]]],
+    source: str,
+    target: str,
+    label: str
+) -> None:
+    edge_key = f"{source}->{target}|{label}"
+    if any(f"{edge.get('from')}->{edge.get('to')}|{edge.get('label', '')}" == edge_key for edge in memory["edges"]):
+        return
+    memory["edges"].append({"from": source, "to": target, "label": label})
+
+
+def describe_event(function_name: str, line_number: int, line_text: str) -> str:
+    normalized = line_text.strip()
+    if normalized.startswith("return"):
+        return f"Return from {function_name}"
+    if "push_back" in normalized:
+        return "Append to vector"
+    if ".insert(" in normalized:
+        return "Insert into set"
+    if re.search(r"\w+\s*\[.*\]\s*=", normalized):
+        return "Update associative entry"
+    if re.search(r"\bif\s*\(", normalized):
+        return f"Evaluate branch in {function_name}"
+    if re.search(r"\bfor\s*\(", normalized):
+        return f"Enter loop in {function_name}"
+    if re.search(r"\bwhile\s*\(", normalized):
+        return f"Evaluate loop in {function_name}"
+    if re.search(r"\b(?:int|double|float|char|bool|std::vector|std::map|std::set|std::stack|vector|map|set|stack)\b", normalized):
+        return f"Initialize state in {function_name}"
+    return f"Execute line {line_number} in {function_name}"
+
+
+def describe_summary(
+    function_name: str,
+    line_text: str,
+    stack_depth: int,
+    containers: dict[str, list[dict[str, Any]]]
+) -> str:
+    parts = [f"`{function_name}` is focused on `{line_text}`."]
+    if stack_depth > 1:
+        parts.append(f"Call depth is {stack_depth}, so recursion or nested flow is active.")
+    if (
+        containers["arrays"]
+        or containers["maps"]
+        or containers["sets"]
+        or containers["stacks"]
+        or containers["queues"]
+        or containers["priorityQueues"]
+        or containers["lists"]
+        or containers["graphs"]
+    ):
+        parts.append("Container views were captured directly from the current frame.")
+    else:
+        parts.append("Scalar locals and stack shape are the important signals here.")
+    return " ".join(parts)
+
+
+def main() -> None:
+    port = int(os.environ.get("PORT", "8000"))
+    host = os.environ.get("HOST", "127.0.0.1")
+    server = ThreadingHTTPServer((host, port), AppHandler)
+    print(f"Serving C++ Flow Studio at http://{host}:{port}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
