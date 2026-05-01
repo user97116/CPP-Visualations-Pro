@@ -12,7 +12,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parent
-MAX_TRACE_STEPS = 160
+MAX_TRACE_STEPS = 2000
 TRACE_JSON_PREFIX = "__CODEX_JSON__"
 
 
@@ -55,9 +55,13 @@ class CppTracer:
             self._mark_changed_values(steps)
             self._attach_flow_nodes(steps)
 
+            # Final stdout = what was printed by the last step
+            final_stdout = steps[-1].get("stdout", "") if steps else ""
+
             return {
                 "title": "Real LLDB trace",
                 "code": code,
+                "stdout": final_stdout,
                 "steps": steps
             }
 
@@ -81,12 +85,32 @@ class CppTracer:
         if result.returncode != 0:
             raise TraceError("Compilation failed.", details=(result.stderr or result.stdout).strip())
 
+    def _extract_stdout(self, raw_output: str) -> str:
+        noise = re.compile(
+            r'^(\(lldb\)|Process \d+|Breakpoint \d+|Current executable|Executing commands|Target \d+:'
+            r'|\* thread #|\s+frame #'
+            r'|\s*->\s+\d+\s'
+            r'|\s+\d+\s+\t'
+            r'|\s*\^'
+            r'|error:|warning:'
+            r')'
+        )
+        lines = [
+            line for line in raw_output.splitlines()
+            if TRACE_JSON_PREFIX not in line
+            and not noise.match(line)
+            and line.strip()
+        ]
+        return "\n".join(lines)
+
     def _run_lldb(self, binary_path: Path, source_path: Path, code: str) -> str:
         commands_path = binary_path.with_suffix(".lldb")
         helper_path = binary_path.with_suffix(".py")
+        stdout_path = binary_path.with_suffix(".out")
+        stdout_path.write_text("", encoding="utf-8")
         helper_path.write_text(self._build_lldb_helper(), encoding="utf-8")
         commands_path.write_text(
-            self._build_lldb_script(source_path, code, helper_path),
+            self._build_lldb_script(source_path, code, helper_path, stdout_path),
             encoding="utf-8"
         )
 
@@ -103,25 +127,26 @@ class CppTracer:
 
         return (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
 
-    def _build_lldb_script(self, source_path: Path, code: str, helper_path: Path) -> str:
+    def _build_lldb_script(self, source_path: Path, code: str, helper_path: Path, stdout_path: Path) -> str:
         lines = code.splitlines()
         commands = [
             f"command script import {helper_path}",
-            "settings set target.max-children-count 32"
+            "settings set target.max-children-count 32",
+            "settings set target.inline-breakpoint-strategy always",
         ]
 
         for line_number, line in enumerate(lines, start=1):
             stripped = line.strip()
-            if not stripped or stripped in {"{", "}"}:
-                continue
-            if stripped.startswith("#") or stripped.startswith("//"):
-                continue
+            # if not stripped or stripped in {"{", "}", "};"}:
+            #     continue
+            # if stripped.startswith("#") or stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+            #     continue
             commands.append(f"breakpoint set --file {source_path.name} --line {line_number}")
 
-        commands.append("run")
+        commands.append(f"process launch -o {stdout_path} -e /dev/null")
 
         for _ in range(MAX_TRACE_STEPS):
-            commands.append(f"codex-step {source_path.name}")
+            commands.append(f"codex-step {source_path.name} {stdout_path}")
             commands.append("continue")
 
         return "\n".join(commands) + "\n"
@@ -137,7 +162,10 @@ def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand('command script add -f ' + __name__ + '.emit_step codex-step')
 
 def emit_step(debugger, command, result, internal_dict):
-    source_name = command.strip()
+    parts = command.strip().split(None, 1)
+    source_name = parts[0]
+    stdout_path = parts[1] if len(parts) > 1 else None
+
     target = debugger.GetSelectedTarget()
     process = target.GetProcess()
     thread = process.GetSelectedThread()
@@ -151,9 +179,18 @@ def emit_step(debugger, command, result, internal_dict):
     current_file = current_line_entry.GetFileSpec().GetFilename() if current_line_entry.IsValid() else ''
     current_line = current_line_entry.GetLine() if current_line_entry.IsValid() else 0
 
+    stdout_so_far = ''
+    if stdout_path:
+        try:
+            with open(stdout_path, 'r', errors='replace') as f:
+                stdout_so_far = f.read()
+        except Exception:
+            pass
+
     payload = {{
         'file': current_file,
         'line': current_line,
+        'stdout': stdout_so_far,
         'frames': []
     }}
 
@@ -175,11 +212,19 @@ def emit_step(debugger, command, result, internal_dict):
         vars_result.Clear()
         interpreter.HandleCommand(f'frame select {{index}}', select_result)
         interpreter.HandleCommand('frame variable', vars_result)
+
+        arg_vars = frame.GetVariables(True, False, False, False)
+        args_list = []
+        for i in range(arg_vars.GetSize()):
+            v = arg_vars.GetValueAtIndex(i)
+            args_list.append(f'{{v.GetName()}} = {{v.GetValue() or v.GetSummary() or "?"}}')
+
         payload['frames'].append({{
             'index': index,
             'function': function_name,
             'line': line_entry.GetLine(),
-            'vars_raw': vars_result.GetOutput() or ''
+            'vars_raw': vars_result.GetOutput() or '',
+            'args': args_list
         }})
 
     interpreter.HandleCommand('frame select 0', select_result)
@@ -213,6 +258,8 @@ def emit_step(debugger, command, result, internal_dict):
                     raw_frame.get("line", current_line),
                     declaration_lines
                 )
+                args = raw_frame.get("args", [])
+                stack_frames[depth]["args"] = args
                 if depth == 0:
                     variables_by_depth[depth] = variables
                 containers_by_depth[depth] = containers
@@ -223,9 +270,9 @@ def emit_step(debugger, command, result, internal_dict):
                 locals_payload = variables_by_depth.get(depth, [])
                 stack_payload.append(
                     {
-                        "id": f"{frame['name']}|{depth}|{frame['signature']}",
+                        "id": f"{frame['name']}|{depth}",
                         "name": frame["name"],
-                        "args": frame["args"],
+                        "args": frame.get("args", []),
                         "locals": locals_payload,
                         "status": "active" if depth == 0 else "waiting",
                         "active": depth == 0
@@ -245,6 +292,7 @@ def emit_step(debugger, command, result, internal_dict):
                     "line": current_line,
                     "event": event,
                     "summary": summary,
+                    "stdout": payload.get("stdout", "").rstrip(),
                     "stack": stack_payload,
                     "containers": merged_containers,
                     "activeContainers": top_containers,
@@ -258,8 +306,10 @@ def emit_step(debugger, command, result, internal_dict):
         frames = []
         for depth, frame in enumerate(raw_frames):
             function = frame.get("function", "<anonymous>")
-            name, args = split_function_signature(function)
-            signature = f"{name}|{args}|{frame.get('line', 0)}"
+            # name, args = split_function_signature(function)
+            name, _ = split_function_signature(function)
+            args = []
+            signature = f"{name}|{depth}"
             frames.append(
                 {
                     "depth": depth,
@@ -290,14 +340,14 @@ def emit_step(debugger, command, result, internal_dict):
         last_seen = empty_containers()
 
         for step in steps:
-            merged = empty_containers()
             current = step.get("containers", empty_containers())
+            merged = empty_containers()
 
             for kind in ("arrays", "maps", "sets", "stacks", "queues", "priorityQueues", "lists", "graphs"):
                 current_items = current.get(kind, [])
                 if current_items:
                     last_seen[kind] = current_items
-                merged[kind] = last_seen[kind]
+                merged[kind] = list(last_seen[kind])
 
             step["containers"] = merged
 
@@ -494,8 +544,8 @@ def dedupe_consecutive_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]
             json.dumps(step["stack"], sort_keys=True),
             json.dumps(step["containers"], sort_keys=True)
         )
-        if signature == previous_signature:
-            continue
+        # if signature == previous_signature:
+        #     continue
         deduped.append(step)
         previous_signature = signature
 
@@ -542,12 +592,19 @@ def parse_frame_variables(
         name = start.group(2)
         value_text = start.group(3)
         declaration_line = declaration_lines.get(name, -1)
-        if declaration_line > current_line:
+        if declaration_line >= current_line:
             index += 1
             if value_text.endswith("{"):
                 while index < len(rows) and rows[index].strip() != "}":
                     index += 1
                 index += 1
+            continue
+
+        if is_string_type(typename):
+            str_value = value_text.strip('"')
+            containers["arrays"].append({"name": name, "kind": "string", "values": list(str_value)})
+            variables.append({"name": name, "value": str_value})
+            index += 1
             continue
 
         if is_map_type(typename) and value_text.startswith("size="):
@@ -556,7 +613,8 @@ def parse_frame_variables(
                 if is_graph_adjacency_map(entries):
                     containers["graphs"].append({"name": name, "edges": entries})
                 else:
-                    containers["maps"].append({"name": name, "entries": entries})
+                    kind = "unordered_map" if "unordered_map" in typename else "map"
+                    containers["maps"].append({"name": name, "kind": kind, "entries": entries})
                 variables.append({"name": name, "value": dict(entries)})
                 index = next_index
                 continue
@@ -575,7 +633,8 @@ def parse_frame_variables(
         if is_set_type(typename) and value_text.startswith("size="):
             values, next_index = parse_set(rows, index)
             if values is not None:
-                containers["sets"].append({"name": name, "values": values})
+                kind = "unordered_set" if "unordered_set" in typename else "set"
+                containers["sets"].append({"name": name, "kind": kind, "values": values})
                 variables.append({"name": name, "value": values})
                 index = next_index
                 continue
@@ -605,6 +664,11 @@ def parse_frame_variables(
                 continue
 
         if is_queue_type(typename):
+            if value_text.endswith("{}"):
+                containers["queues"].append({"name": name, "values": []})
+                variables.append({"name": name, "value": []})
+                index += 1
+                continue
             values, next_index = parse_queue(rows, index)
             if values is not None:
                 containers["queues"].append({"name": name, "values": values})
@@ -613,6 +677,11 @@ def parse_frame_variables(
                 continue
 
         if is_priority_queue_type(typename):
+            if value_text.endswith("{}"):
+                containers["priorityQueues"].append({"name": name, "values": []})
+                variables.append({"name": name, "value": []})
+                index += 1
+                continue
             values, next_index = parse_priority_queue(rows, index)
             if values is not None:
                 containers["priorityQueues"].append({"name": name, "values": values})
@@ -633,8 +702,8 @@ def parse_frame_variables(
             add_memory_node(memory, variable_id, name, "variable")
             address = normalize_address(extract_address(value_text))
             if address:
-                add_memory_node(memory, address, address, "address")
-                add_memory_edge(memory, variable_id, address, "points")
+                add_memory_node(memory, address, f"*{name}", "address")
+                add_memory_edge(memory, variable_id, address, address)
                 variables.append({"name": name, "value": address})
             elif value_text.strip() in {"nullptr", "null", "0x0"}:
                 variables.append({"name": name, "value": "nullptr"})
@@ -955,6 +1024,11 @@ def parse_pointer_object_block(
                 )
         index += 1
     return edges, index
+
+
+def is_string_type(typename: str) -> bool:
+    return typename in ("std::string", "std::__1::string", "std::__cxx11::string", "string") or \
+        "basic_string" in typename
 
 
 def is_vector_type(typename: str) -> bool:
