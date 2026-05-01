@@ -199,10 +199,10 @@ p {
   display: grid;
   grid-template-columns: 1fr;
   grid-template-areas:
+    "collections"
     "stack"
     "flow"
-    "memory"
-    "collections";
+    "memory";
   gap: 18px;
   margin-top: 18px;
 }

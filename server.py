@@ -52,10 +52,10 @@ class CppTracer:
                 )
 
             self._carry_forward_containers(steps)
+            self._carry_forward_variables(steps)
             self._mark_changed_values(steps)
             self._attach_flow_nodes(steps)
 
-            # Final stdout = what was printed by the last step
             final_stdout = steps[-1].get("stdout", "") if steps else ""
 
             return {
@@ -137,10 +137,6 @@ class CppTracer:
 
         for line_number, line in enumerate(lines, start=1):
             stripped = line.strip()
-            # if not stripped or stripped in {"{", "}", "};"}:
-            #     continue
-            # if stripped.startswith("#") or stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
-            #     continue
             commands.append(f"breakpoint set --file {source_path.name} --line {line_number}")
 
         commands.append(f"process launch -o {stdout_path} -e /dev/null")
@@ -260,17 +256,19 @@ def emit_step(debugger, command, result, internal_dict):
                 )
                 args = raw_frame.get("args", [])
                 stack_frames[depth]["args"] = args
-                if depth == 0:
-                    variables_by_depth[depth] = variables
+                variables_by_depth[depth] = variables
                 containers_by_depth[depth] = containers
                 memory_by_depth[depth] = memory
 
+            # Build stack payload ONCE per step
             stack_payload = []
+            total_frames = len(stack_frames)
             for depth, frame in enumerate(stack_frames):
                 locals_payload = variables_by_depth.get(depth, [])
+                bottom_index = total_frames - 1 - depth
                 stack_payload.append(
                     {
-                        "id": f"{frame['name']}|{depth}",
+                        "id": f"{frame['name']}|{bottom_index}",
                         "name": frame["name"],
                         "args": frame.get("args", []),
                         "locals": locals_payload,
@@ -306,7 +304,6 @@ def emit_step(debugger, command, result, internal_dict):
         frames = []
         for depth, frame in enumerate(raw_frames):
             function = frame.get("function", "<anonymous>")
-            # name, args = split_function_signature(function)
             name, _ = split_function_signature(function)
             args = []
             signature = f"{name}|{depth}"
@@ -351,6 +348,27 @@ def emit_step(debugger, command, result, internal_dict):
 
             step["containers"] = merged
 
+    def _carry_forward_variables(self, steps: list[dict[str, Any]]) -> None:
+        """Persist locals across steps, but let block-scoped variables disappear."""
+        last_seen: dict[str, dict[str, Any]] = {}
+
+        for step in steps:
+            current_seen: dict[str, dict[str, Any]] = {}
+            for frame in step["stack"]:
+                frame_id = frame["id"]
+                current = {var["name"]: dict(var) for var in frame.get("locals", [])}
+
+                if current:
+                    # LLDB gave us a real variable list → trust it (block scope respected)
+                    merged = current
+                else:
+                    # LLDB reported nothing → fall back to last known state
+                    merged = {name: dict(var) for name, var in last_seen.get(frame_id, {}).items()}
+
+                frame["locals"] = list(merged.values())
+                current_seen[frame_id] = merged
+
+            last_seen = current_seen
     def _attach_flow_nodes(self, steps: list[dict[str, Any]]) -> None:
         seen_nodes: list[dict[str, Any]] = []
         seen_edges: list[dict[str, str]] = []
@@ -423,7 +441,7 @@ class AppHandler(SimpleHTTPRequestHandler):
                     "details": exc.details
                 }
             )
-        except Exception as exc:  # pragma: no cover - safety net for local tool usage
+        except Exception as exc:
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"error": "Unexpected tracing failure.", "details": str(exc)}
@@ -544,8 +562,6 @@ def dedupe_consecutive_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]
             json.dumps(step["stack"], sort_keys=True),
             json.dumps(step["containers"], sort_keys=True)
         )
-        # if signature == previous_signature:
-        #     continue
         deduped.append(step)
         previous_signature = signature
 
@@ -555,14 +571,38 @@ def dedupe_consecutive_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]
 def find_declaration_lines(code: str) -> dict[str, int]:
     declarations: dict[str, int] = {}
     pattern = re.compile(
-        r"(?:^|\s)(?:const\s+)?(?:std::\w+(?:<[^;]+>)?|\w+(?:<[^;]+>)?|unsigned|signed|long long|long|int|double|float|char|bool|string)\s+([A-Za-z_]\w*)"
+        r"(?:^|\s)(?:const\s+)?(?:std::\w+(?:<[^;]+>)?|\w+(?:<[^;]+>)?|unsigned|signed|long long|long|int|double|float|char|bool|string)\s+([^;{]+)"
     )
 
     for line_number, line in enumerate(code.splitlines(), start=1):
         for match in pattern.finditer(line):
-            declarations.setdefault(match.group(1), line_number)
+            decl_list = match.group(1)
+            parts = split_top_level(decl_list, ',')
+            for part in parts:
+                var_match = re.search(r'^[A-Za-z_]\w*', part.strip())
+                if var_match:
+                    declarations.setdefault(var_match.group(0), line_number)
 
     return declarations
+
+
+def split_top_level(text: str, delimiter: str) -> list[str]:
+    parts = []
+    current = ""
+    depth = 0
+    for char in text:
+        if char in '<({[':
+            depth += 1
+        elif char in '>)}]':
+            depth -= 1
+        elif char == delimiter and depth == 0:
+            parts.append(current)
+            current = ""
+            continue
+        current += char
+    if current:
+        parts.append(current)
+    return parts
 
 
 def parse_frame_variables(
@@ -592,7 +632,7 @@ def parse_frame_variables(
         name = start.group(2)
         value_text = start.group(3)
         declaration_line = declaration_lines.get(name, -1)
-        if declaration_line >= current_line:
+        if declaration_line > current_line:
             index += 1
             if value_text.endswith("{"):
                 while index < len(rows) and rows[index].strip() != "}":
