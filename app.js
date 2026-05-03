@@ -19,6 +19,7 @@ const dom = {
   stepSlider: document.querySelector("#step-slider"),
   stepSummary: document.querySelector("#step-summary"),
   codeVisual: document.querySelector("#code-visual"),
+  codeMapVisual: document.querySelector("#code-map-visual"),
   stackView: document.querySelector("#stack-view"),
   flowView: document.querySelector("#flow-view"),
   toggleFlowGraph: document.querySelector("#toggle-flow-graph"),
@@ -232,6 +233,7 @@ function render() {
   }
 
   renderCode(trace, step);
+  renderCodeMap(trace);
   renderStack(step);
   renderFlow(step);
   const memoryStep = trace && state.memoryFrozen ? trace.steps[state.memoryStepIndex] : step;
@@ -278,6 +280,125 @@ function renderCode(trace, step) {
     line.append(lineNumber, lineContent);
     dom.codeVisual.append(line);
   });
+}
+
+function renderCodeMap(trace) {
+  dom.codeMapVisual.innerHTML = "";
+  const code = trace?.code || dom.codeEditor.value || "";
+  if (!code.trim()) {
+    dom.codeMapVisual.innerHTML = `<div class="empty-state">Write code in the editor to build a static call map.</div>`;
+    return;
+  }
+
+  const { functions, edges } = buildCodeStructureMap(code);
+  if (!functions.length) {
+    dom.codeMapVisual.innerHTML = `<div class="empty-state">No function definitions matched for the code map. Try top-level functions with a trailing <code>{</code>.</div>`;
+    return;
+  }
+
+  const NODE_W = 120;
+  const NODE_H = 44;
+  const GAP_X = 36;
+  const GAP_Y = 56;
+  const PAD = 24;
+  const cols = Math.max(2, Math.ceil(Math.sqrt(functions.length)));
+  const positions = new Map();
+  functions.forEach((fn, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    positions.set(fn.name, {
+      x: PAD + col * (NODE_W + GAP_X) + NODE_W / 2,
+      y: PAD + row * (NODE_H + GAP_Y) + NODE_H / 2
+    });
+  });
+
+  const edgeSet = new Set(edges.map((e) => `${e.from}→${e.to}`));
+  const edgePaths = [];
+  edgeSet.forEach((key) => {
+    const [from, to] = key.split("→");
+    const a = positions.get(from);
+    const b = positions.get(to);
+    if (!a || !b) {
+      return;
+    }
+    const x1 = a.x, y1 = a.y + NODE_H / 2;
+    const x2 = b.x, y2 = b.y - NODE_H / 2;
+    const mid = (y1 + y2) / 2;
+    edgePaths.push(`<path class="code-map-edge" d="M${x1},${y1} C${x1},${mid} ${x2},${mid} ${x2},${y2}" />`);
+  });
+
+  const nodesSvg = functions.map((fn) => {
+    const pos = positions.get(fn.name);
+    if (!pos) {
+      return "";
+    }
+    const x = pos.x, y = pos.y;
+    const active = trace?.steps?.[state.stepIndex];
+    const onStack = active?.stack?.some((f) => f.name === fn.name);
+    const cls = onStack ? "code-map-node code-map-node--hot" : "code-map-node";
+    return `
+      <g class="${cls}" transform="translate(${x},${y})">
+        <rect x="${-NODE_W / 2}" y="${-NODE_H / 2}" rx="10" ry="10" width="${NODE_W}" height="${NODE_H}" />
+        <text y="-4" text-anchor="middle" class="code-map-name">${escapeHtml(fn.name)}</text>
+        <text y="12" text-anchor="middle" class="code-map-params">${escapeHtml(fn.paramsShort)}</text>
+        <title>${escapeHtml(`${fn.name}(${fn.params})`)}</title>
+      </g>`;
+  }).join("");
+
+  const width = PAD * 2 + cols * NODE_W + (cols - 1) * GAP_X;
+  const rows = Math.ceil(functions.length / cols);
+  const height = PAD * 2 + rows * NODE_H + (rows - 1) * GAP_Y;
+
+  dom.codeMapVisual.innerHTML = `
+    <div class="code-map-scroll">
+      <svg class="code-map-svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img">
+        <g class="code-map-lines">${edgePaths.join("")}</g>
+        <g class="code-map-nodes">${nodesSvg}</g>
+      </svg>
+    </div>`;
+}
+
+function buildCodeStructureMap(code) {
+  const declRe = /^\s*(?:template\s*<[^>]+>\s*)?(?:inline\s+|static\s+|constexpr\s+)*(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:[\w:<>,\s]+\s+)+(\w+)\s*\(([^)]*)\)\s*(?:const\s*)?(?:noexcept\s*)?\{/gm;
+  const functions = [];
+  let match;
+  while ((match = declRe.exec(code)) !== null) {
+    const name = match[1];
+    const params = match[2].trim();
+    if (name === "if" || name === "for" || name === "while" || name === "switch") {
+      continue;
+    }
+    const paramsShort = params.length > 22 ? `${params.slice(0, 21)}…` : params;
+    functions.push({ name, params, paramsShort, start: match.index });
+  }
+
+  functions.sort((a, b) => a.start - b.start);
+  const names = new Set(functions.map((f) => f.name));
+  const edges = [];
+  for (let i = 0; i < functions.length; i += 1) {
+    const fn = functions[i];
+    const end = i + 1 < functions.length ? functions[i + 1].start : code.length;
+    const slice = code.slice(fn.start, end);
+    const callRe = /\b([A-Za-z_]\w*)\s*\(/g;
+    let cm;
+    const seen = new Set();
+    while ((cm = callRe.exec(slice)) !== null) {
+      const callee = cm[1];
+      if (callee === fn.name) {
+        continue;
+      }
+      if (!names.has(callee)) {
+        continue;
+      }
+      if (seen.has(callee)) {
+        continue;
+      }
+      seen.add(callee);
+      edges.push({ from: fn.name, to: callee });
+    }
+  }
+
+  return { functions, edges };
 }
 
 function renderStack(step) {
@@ -363,10 +484,14 @@ function renderStack(step) {
         const hidden = state.hiddenVariables.has(variableKey);
         const chip = document.createElement("div");
         chip.className = `variable-chip ${variable.changed ? "changed" : ""}`;
+        const typeLine = variable.type
+          ? `<div class="variable-type" title="${escapeHtml(variable.type)}">${escapeHtml(shortType(variable.type))}</div>`
+          : "";
         chip.innerHTML = hidden
           ? `<div class="hidden-variable">${variable.name} hidden</div>`
           : `
             <div class="variable-name">${variable.name}</div>
+            ${typeLine}
             <div class="variable-value">${formatValue(variable.value)}</div>
           `;
 
@@ -506,6 +631,7 @@ function renderFlow(step) {
           <div class="node-label">${escapeHtml(node.function || node.label)}</div>
           <div class="node-meta">${escapeHtml((node.params || []).length ? (node.params || []).join(", ") : "no params")}</div>
           <div class="node-meta">${escapeHtml(node.meta)}</div>
+          <div class="node-meta node-activation">${escapeHtml(node.id)}</div>
         </div>
       `).join("")}
     </div>`
@@ -531,69 +657,131 @@ function renderMemory(step) {
     return;
   }
 
-  const CW = 160, CH = 56, HGAP = 24, VGAP = 72, PAD = 20;
+  const CW = 168;
+  const CH = 58;
+  const VGAP = 88;
+  const PAD = 24;
+  const arrowId = `mem-arrow-${state.memoryFrozen ? state.memoryStepIndex : state.stepIndex}`;
 
-  const varNodes = nodes.filter(n => n.kind === "variable");
-  const addrNodes = nodes.filter(n => n.kind !== "variable");
+  const varNodes = nodes.filter((n) => n.kind === "variable");
+  const addrNodes = nodes.filter((n) => n.kind !== "variable");
 
-  const varX = new Map(varNodes.map((n, i) => [n.id, PAD + i * (CW + HGAP) + CW / 2]));
-  const addrX = new Map(addrNodes.map((n, i) => [n.id, PAD + i * (CW + HGAP) + CW / 2]));
+  const incoming = new Map();
+  edges.forEach((edge) => {
+    if (!incoming.has(edge.to)) {
+      incoming.set(edge.to, []);
+    }
+    incoming.get(edge.to).push(edge.from);
+  });
+
+  const varX = new Map();
+  varNodes.forEach((n, i) => {
+    varX.set(n.id, PAD + CW / 2 + i * (CW + 20));
+  });
+
+  const sortedAddrs = [...addrNodes].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const addrX = new Map();
+  sortedAddrs.forEach((n, i) => {
+    const sources = incoming.get(n.id) || [];
+    let x;
+    if (sources.length) {
+      const xs = sources.map((s) => varX.get(s)).filter((v) => typeof v === "number");
+      x = xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : PAD + CW / 2 + i * (CW + 20);
+    } else {
+      x = PAD + CW / 2 + i * (CW + 20);
+    }
+    addrX.set(n.id, x);
+  });
+
+  const bumpOverlaps = (map, minGap) => {
+    const entries = [...map.entries()].sort((a, b) => a[1] - b[1]);
+    for (let i = 1; i < entries.length; i += 1) {
+      const prev = entries[i - 1][1];
+      const curId = entries[i][0];
+      let cur = entries[i][1];
+      if (cur - prev < minGap) {
+        cur = prev + minGap;
+        map.set(curId, cur);
+        entries[i][1] = cur;
+      }
+    }
+  };
+  bumpOverlaps(varX, CW + 12);
+  bumpOverlaps(addrX, CW + 12);
 
   const varY = PAD + CH / 2;
   const addrY = PAD + CH + VGAP + CH / 2;
 
   const xFor = (id) => varX.get(id) ?? addrX.get(id) ?? PAD + CW / 2;
-  const yFor = (id) => varX.has(id) ? varY : addrY;
+  const yFor = (id) => (varX.has(id) ? varY : addrY);
 
-  const totalCols = Math.max(varNodes.length, addrNodes.length);
-  const svgW = PAD * 2 + totalCols * (CW + HGAP) - HGAP;
+  const maxX = Math.max(
+    ...[...varX.values(), ...addrX.values()].map((x) => x + CW / 2),
+    PAD + CW
+  );
+  const svgW = Math.max(maxX + PAD, PAD * 2 + CW);
   const svgH = addrNodes.length ? addrY + CH / 2 + PAD : varY + CH / 2 + PAD;
 
-  const edgeSvg = edges.map(edge => {
-    const x1 = xFor(edge.from), y1 = yFor(edge.from) + CH / 2;
-    const x2 = xFor(edge.to),   y2 = yFor(edge.to) - CH / 2;
-    if (!x1 || !x2) return "";
-    const rawLabel = edge.label || "";
-    const label = rawLabel.startsWith("0x") && rawLabel.length > 10
-      ? rawLabel.slice(0, 6) + "…" + rawLabel.slice(-4) : rawLabel;
-    const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
-    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" marker-end="url(#arrow)" />
-            ${label ? `<text class="edge-label" x="${mx + 6}" y="${my}" text-anchor="start">${escapeHtml(label)}</text>` : ""}`;
-  }).join("");
+  const edgeSvg = edges
+    .map((edge) => {
+      const x1 = xFor(edge.from);
+      const y1 = yFor(edge.from) + CH / 2;
+      const x2 = xFor(edge.to);
+      const y2 = yFor(edge.to) - CH / 2;
+      if (x1 === undefined || x2 === undefined) {
+        return "";
+      }
+      const rawLabel = edge.label || "";
+      const shortLabel =
+        rawLabel.startsWith("0x") && rawLabel.length > 12
+          ? `${rawLabel.slice(0, 6)}…${rawLabel.slice(-4)}`
+          : rawLabel;
+      const mx = (x1 + x2) / 2;
+      const my = (y1 + y2) / 2;
+      const title = escapeHtml(`${rawLabel || "points to"} → ${edge.to}`);
+      return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" marker-end="url(#${arrowId})">
+          <title>${title}</title>
+        </line>
+        ${shortLabel ? `<text class="edge-label" x="${mx + 6}" y="${my - 4}" text-anchor="start">${escapeHtml(shortLabel)}</text>` : ""}`;
+    })
+    .join("");
 
   const renderNode = (n, x, y) => {
     const isAddr = n.kind !== "variable";
     const cls = isAddr ? "memory-node address-node" : "memory-node variable-node";
     const label = escapeHtml(n.label || n.id);
     let sub = "";
+    let fullTitle = `${n.label || n.id}`;
     if (!isAddr) {
-      const edge = edges.find(e => e.from === n.id);
-      if (edge) {
-        const addr = edge.to;
-        sub = addr.length > 12 ? addr.slice(0, 6) + "…" + addr.slice(-4) : addr;
+      const out = edges.find((e) => e.from === n.id);
+      if (out) {
+        fullTitle = `${n.label} → ${out.to} (${out.label || "ref"})`;
+        sub = out.to.length > 14 ? `${out.to.slice(0, 6)}…${out.to.slice(-4)}` : out.to;
       }
     } else {
-      sub = n.id.length > 12 ? n.id.slice(0, 6) + "…" + n.id.slice(-4) : n.id;
+      fullTitle = `Object @ ${n.id}`;
+      sub = n.id.length > 14 ? `${n.id.slice(0, 6)}…${n.id.slice(-4)}` : n.id;
     }
-    return `<g class="${cls}">
-      <rect x="${x - CW/2}" y="${y - CH/2}" width="${CW}" height="${CH}" rx="10" />
-      <text x="${x}" y="${y - 7}" text-anchor="middle" class="mem-name">${label}</text>
-      <text x="${x}" y="${y + 10}" text-anchor="middle" class="mem-val">${escapeHtml(sub)}</text>
+    return `<g class="${cls}" transform="translate(${x},${y})">
+      <title>${escapeHtml(fullTitle)}</title>
+      <rect x="${-CW / 2}" y="${-CH / 2}" width="${CW}" height="${CH}" rx="10" />
+      <text y="-8" text-anchor="middle" class="mem-name">${label}</text>
+      <text y="12" text-anchor="middle" class="mem-val">${escapeHtml(sub)}</text>
     </g>`;
   };
 
   const nodesSvg = [
-    ...varNodes.map(n => renderNode(n, varX.get(n.id), varY)),
-    ...addrNodes.map(n => renderNode(n, addrX.get(n.id), addrY))
+    ...varNodes.map((n) => renderNode(n, varX.get(n.id), varY)),
+    ...addrNodes.map((n) => renderNode(n, addrX.get(n.id), addrY))
   ].join("");
 
   dom.memoryView.innerHTML = `
-    <div class="memory-meta">${edges.length} pointer${edges.length !== 1 ? "s" : ""} | ${varNodes.length} variable${varNodes.length !== 1 ? "s" : ""}</div>
+    <div class="memory-meta">${edges.length} edge${edges.length !== 1 ? "s" : ""} · ${varNodes.length} variable${varNodes.length !== 1 ? "s" : ""} · ${addrNodes.length} address${addrNodes.length !== 1 ? "es" : ""}</div>
     <div class="memory-svg-scroll">
       <svg class="memory-svg" viewBox="0 0 ${svgW} ${svgH}" width="${svgW}" height="${svgH}" role="img" aria-label="Address graph">
         <defs>
-          <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-            <path d="M0,0 L0,6 L8,3 z" fill="rgba(124,184,255,0.7)" />
+          <marker id="${arrowId}" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L9,3 z" fill="rgba(124,184,255,0.75)" />
           </marker>
         </defs>
         <g class="memory-lines">${edgeSvg}</g>
@@ -602,22 +790,105 @@ function renderMemory(step) {
     </div>`;
 }
 
-function createContainerCard(name, type, typeClass, isActive) {
-  const card = document.createElement("div");
-  card.className = `container-card ct-${typeClass}${isActive ? " current-frame" : ""}`;
-  card.innerHTML = `<div class="container-title">
+function shortType(typename) {
+  const t = String(typename);
+  if (t.length <= 56) {
+    return t;
+  }
+  return `${t.slice(0, 28)}…${t.slice(-24)}`;
+}
+
+function buildAdjacencySvg(edges, nameHint) {
+  if (!edges.length) {
+    return "";
+  }
+  const nodes = new Set();
+  edges.forEach(([u, vs]) => {
+    nodes.add(String(u));
+    (Array.isArray(vs) ? vs : []).forEach((v) => nodes.add(String(v)));
+  });
+  const list = [...nodes];
+  if (!list.length) {
+    return "";
+  }
+  const idx = new Map(list.map((n, i) => [n, i]));
+  const R = 24;
+  const PAD = 24;
+  const step = Math.max(80, Math.min(120, 640 / Math.max(list.length, 1)));
+  const W = PAD * 2 + Math.max(list.length - 1, 0) * step + R * 2;
+  const H = PAD * 2 + R * 2 + 36;
+  const pos = list.map((n, i) => ({
+    id: n,
+    x: PAD + R + i * step,
+    y: PAD + R + 8
+  }));
+  const markerId = `ct-arw-${Math.abs(hashString(String(nameHint) + list.join(",")))}`;
+  const edgeLines = [];
+  edges.forEach(([u, vs]) => {
+    const a = pos[idx.get(String(u))];
+    if (!a || !Array.isArray(vs)) {
+      return;
+    }
+    vs.forEach((v) => {
+      const b = pos[idx.get(String(v))];
+      if (!b) {
+        return;
+      }
+      edgeLines.push(
+        `<line class="ct-adj-edge" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" marker-end="url(#${markerId})" />`
+      );
+    });
+  });
+  const circles = pos
+    .map((p) => {
+      const short = p.id.length > 8 ? `${p.id.slice(0, 7)}…` : p.id;
+      return `<g class="ct-adj-node" transform="translate(${p.x},${p.y})">
+        <circle r="${R}" />
+        <text y="4" text-anchor="middle" class="ct-adj-label">${escapeHtml(short)}</text>
+        <title>${escapeHtml(p.id)}</title>
+      </g>`;
+    })
+    .join("");
+  return `<svg class="ct-adj-svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Adjacency sketch">
+    <defs>
+      <marker id="${markerId}" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="rgba(99,230,190,0.85)" />
+      </marker>
+    </defs>
+    <g>${edgeLines.join("")}</g>
+    <g>${circles}</g>
+  </svg>`;
+}
+
+function hashString(value) {
+  let h = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    h = (h << 5) - h + value.charCodeAt(i);
+    h |= 0;
+  }
+  return h;
+}
+
+function createContainerDetails(name, type, typeClass, isActive) {
+  const details = document.createElement("details");
+  details.className = `container-card ct-${typeClass}${isActive ? " current-frame" : ""}`;
+  details.open = true;
+  const summary = document.createElement("summary");
+  summary.className = "container-summary";
+  summary.innerHTML = `<div class="container-title">
     <strong>${escapeHtml(name)}</strong>
-    <span class="container-type">${type}</span>
+    <span class="container-type">${escapeHtml(type)}</span>
     <span class="container-origin">${isActive ? "active frame" : "parent frame"}</span>
   </div>`;
-  return card;
+  details.append(summary);
+  return details;
 }
 
 function renderContainers(step) {
   dom.containersView.innerHTML = "";
 
   if (!step?.stack?.length) {
-    dom.containersView.innerHTML = `<div class="empty-state">Container-aware visuals show only when vector, deque, map, unordered_map, set, unordered_set, stack, queue, priority_queue, list, or graph data is available.</div>`;
+    dom.containersView.innerHTML = `<div class="empty-state">Container-aware visuals show when vector, matrix (nested vectors), array, deque, map, unordered_map, set, unordered_set, stack, queue, priority_queue, list, string, or graph data is available.</div>`;
     return;
   }
 
@@ -628,25 +899,57 @@ function renderContainers(step) {
     if (countContainers(containers) === 0) return;
     hasAny = true;
 
-    const section = document.createElement("div");
-    section.className = "frame-containers-section";
+    const frameDetails = document.createElement("details");
+    frameDetails.className = "frame-containers-details";
+    frameDetails.open = Boolean(frame.active);
 
-    const header = document.createElement("div");
-    header.className = `frame-containers-header ${frame.active ? "active-frame-header" : ""}`;
-    header.innerHTML = `
+    const frameSummary = document.createElement("summary");
+    frameSummary.className = `frame-containers-summary ${frame.active ? "active-frame-header" : ""}`;
+    frameSummary.innerHTML = `
       <span class="frame-index">${frameIdx + 1}</span>
       <strong>${escapeHtml(frame.name)}</strong>
       <span class="frame-origin">${frame.active ? "active frame" : "parent frame"}</span>
+      <span class="frame-expand-hint">Collections — click to expand</span>
     `;
-    section.append(header);
+    frameDetails.append(frameSummary);
 
     const content = document.createElement("div");
     content.className = "frame-containers-content";
 
-    // Arrays: vector, deque, string
+    // Arrays: vector, deque, string, std::array, matrix (vector<vector<…>>)
     containers.arrays.forEach((array) => {
       const typeClass = array.kind || "vector";
-      const card = createContainerCard(array.name, typeClass, typeClass, frame.active);
+      const card = createContainerDetails(array.name, typeClass, typeClass, frame.active);
+      if (array.kind === "matrix") {
+        const wrap = document.createElement("div");
+        wrap.className = "ct-matrix-wrap";
+        const rows = Array.isArray(array.values) ? array.values : [];
+        if (!rows.length) {
+          wrap.innerHTML = `<span class="ct-empty">empty matrix</span>`;
+        } else {
+          const colCount = Math.max(...rows.map((r) => (Array.isArray(r) ? r.length : 0)), 0);
+          const table = document.createElement("div");
+          table.className = "ct-matrix-grid";
+          table.style.setProperty("--ct-matrix-cols", String(Math.max(colCount, 1)));
+          rows.forEach((row, ri) => {
+            const cells = Array.isArray(row) ? row : [];
+            for (let ci = 0; ci < colCount; ci += 1) {
+              const cell = document.createElement("div");
+              cell.className = "ct-matrix-cell";
+              const v = cells[ci];
+              const empty = ci >= cells.length;
+              cell.innerHTML = empty
+                ? `<div class="ct-matrix-coord">[${ri},${ci}]</div><div class="ct-val ct-matrix-pad">—</div>`
+                : `<div class="ct-matrix-coord">[${ri},${ci}]</div><div class="ct-val">${escapeHtml(formatValue(v))}</div>`;
+              table.append(cell);
+            }
+          });
+          wrap.append(table);
+        }
+        card.append(wrap);
+        content.append(card);
+        return;
+      }
       const grid = document.createElement("div");
       grid.className = "ct-array-grid";
       if (!array.values.length) {
@@ -665,7 +968,7 @@ function renderContainers(step) {
 
     // Maps
     containers.maps.forEach((map) => {
-      const card = createContainerCard(map.name, map.kind || "map", "map", frame.active);
+      const card = createContainerDetails(map.name, map.kind || "map", "map", frame.active);
       const table = document.createElement("div");
       table.className = "ct-map-table";
       if (!map.entries.length) {
@@ -686,7 +989,7 @@ function renderContainers(step) {
 
     // Sets
     containers.sets.forEach((set) => {
-      const card = createContainerCard(set.name, set.kind || "set", "set", frame.active);
+      const card = createContainerDetails(set.name, set.kind || "set", "set", frame.active);
       const wrap = document.createElement("div");
       wrap.className = "ct-set-wrap";
       if (!set.values.length) {
@@ -705,7 +1008,7 @@ function renderContainers(step) {
 
     // Stacks
     containers.stacks.forEach((stack) => {
-      const card = createContainerCard(stack.name, "stack", "stack", frame.active);
+      const card = createContainerDetails(stack.name, "stack", "stack", frame.active);
       const col = document.createElement("div");
       col.className = "ct-stack-col";
       if (!stack.values.length) {
@@ -724,7 +1027,7 @@ function renderContainers(step) {
 
     // Queues
     containers.queues.forEach((queue) => {
-      const card = createContainerCard(queue.name, "queue", "queue", frame.active);
+      const card = createContainerDetails(queue.name, "queue", "queue", frame.active);
       const row = document.createElement("div");
       row.className = "ct-queue-row";
       if (!queue.values.length) {
@@ -752,7 +1055,7 @@ function renderContainers(step) {
 
     // Priority Queues
     containers.priorityQueues.forEach((pq) => {
-      const card = createContainerCard(pq.name, "priority_queue", "pqueue", frame.active);
+      const card = createContainerDetails(pq.name, "priority_queue", "pqueue", frame.active);
       const col = document.createElement("div");
       col.className = "ct-stack-col";
       if (!pq.values.length) {
@@ -771,7 +1074,7 @@ function renderContainers(step) {
 
     // Lists
     containers.lists.forEach((list) => {
-      const card = createContainerCard(list.name, "list", "list", frame.active);
+      const card = createContainerDetails(list.name, "list", "list", frame.active);
       const row = document.createElement("div");
       row.className = "ct-list-row";
       if (!list.values.length) {
@@ -796,10 +1099,19 @@ function renderContainers(step) {
 
     // Graphs
     containers.graphs.forEach((graph) => {
-      const card = createContainerCard(graph.name, "graph", "graph", frame.active);
+      const card = createContainerDetails(graph.name, "graph", "graph", frame.active);
+      const wrap = document.createElement("div");
+      wrap.className = "ct-graph-visual-wrap";
+      const svgMarkup = buildAdjacencySvg(graph.edges || [], graph.name);
+      if (svgMarkup) {
+        const svgHost = document.createElement("div");
+        svgHost.className = "ct-graph-svg-host";
+        svgHost.innerHTML = svgMarkup;
+        wrap.append(svgHost);
+      }
       const grid = document.createElement("div");
       grid.className = "ct-graph-grid";
-      graph.edges.forEach(([node, neighbors]) => {
+      (graph.edges || []).forEach(([node, neighbors]) => {
         const row = document.createElement("div");
         row.className = "ct-graph-row";
         const nbHtml = Array.isArray(neighbors) && neighbors.length
@@ -809,17 +1121,36 @@ function renderContainers(step) {
           <div class="ct-graph-edges">${nbHtml}</div>`;
         grid.append(row);
       });
-      card.append(grid);
+      wrap.append(grid);
+      card.append(wrap);
       content.append(card);
     });
 
     // Unknowns
     containers.unknowns.forEach((unknown) => {
-      const card = createContainerCard(unknown.name, unknown.kind || "unknown", "unknown", frame.active);
+      const card = createContainerDetails(unknown.name, shortType(unknown.kind || "unknown"), "unknown", frame.active);
       const wrap = document.createElement("div");
       wrap.className = "ct-unknown-wrap";
+      if (unknown.preview) {
+        const hint = document.createElement("div");
+        hint.className = "ct-unknown-hint";
+        hint.textContent = unknown.preview;
+        wrap.append(hint);
+      }
+      const schema = document.createElement("div");
+      schema.className = "ct-default-struct";
+      schema.innerHTML = `
+        <div class="ct-default-struct-title">Default layout</div>
+        <div class="ct-default-struct-rows">
+          <div class="ct-default-field"><span class="ct-default-k">name</span><span class="ct-default-v">${escapeHtml(unknown.name)}</span></div>
+          <div class="ct-default-field"><span class="ct-default-k">type</span><span class="ct-default-v">${escapeHtml(shortType(unknown.kind || "unknown"))}</span></div>
+        </div>`;
+      wrap.append(schema);
       if (!unknown.values || !unknown.values.length) {
-        wrap.innerHTML = `<span class="ct-empty">empty or opaque</span>`;
+        const empty = document.createElement("span");
+        empty.className = "ct-empty";
+        empty.textContent = "No indexed elements parsed — see Locals for scalar fields.";
+        wrap.append(empty);
       } else {
         unknown.values.forEach((v, i) => {
           const cell = document.createElement("div");
@@ -832,12 +1163,12 @@ function renderContainers(step) {
       content.append(card);
     });
 
-    section.append(content);
-    dom.containersView.append(section);
+    frameDetails.append(content);
+    dom.containersView.append(frameDetails);
   });
 
   if (!hasAny) {
-    dom.containersView.innerHTML = `<div class="empty-state">Container-aware visuals show only when vector, deque, map, unordered_map, set, unordered_set, stack, queue, priority_queue, list, or graph data is available.</div>`;
+    dom.containersView.innerHTML = `<div class="empty-state">Container-aware visuals show when vector, matrix (nested vectors), array, deque, map, unordered_map, set, unordered_set, stack, queue, priority_queue, list, string, or graph data is available.</div>`;
   }
 }
 
@@ -923,7 +1254,7 @@ function getContainerContextLabel(step) {
   const active = countContainers(step?.activeContainers);
 
   if (!total) {
-    return "Vector, map, set, stack, graph, list renderers";
+    return "Vector, matrix, map, set, stack, graph, list renderers";
   }
 
   if (active === total) {

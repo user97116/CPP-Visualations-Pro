@@ -23,13 +23,6 @@ class TraceError(Exception):
     status: int = HTTPStatus.BAD_REQUEST
 
 
-def make_frame_key(stack_frames: list[dict[str, Any]], depth: int) -> str:
-    return " > ".join(
-        f"{f['name']}@{f['line']}"
-        for f in stack_frames[: depth + 1]
-    )
-
-
 class CppTracer:
     def __init__(self) -> None:
         compiler = shutil.which("clang++") or shutil.which("g++")
@@ -58,10 +51,11 @@ class CppTracer:
                     details="Try code with a `main()` function and executable statements."
                 )
 
+            self._attach_flow_nodes(steps)
+            steps = dedupe_consecutive_steps(steps)
             self._carry_forward_containers(steps)
             self._carry_forward_variables(steps)
             self._mark_changed_values(steps)
-            self._attach_flow_nodes(steps)
 
             final_stdout = steps[-1].get("stdout", "") if steps else ""
 
@@ -195,8 +189,11 @@ def emit_step(debugger, command, result, internal_dict):
         function_name = frame.GetFunctionName() or frame.GetDisplayFunctionName() or frame.GetName() or '<anonymous>'
         select_result.Clear()
         vars_result.Clear()
+        vars_recursive = lldb.SBCommandReturnObject()
+        vars_recursive.Clear()
         interpreter.HandleCommand(f'frame select {{index}}', select_result)
         interpreter.HandleCommand('frame variable', vars_result)
+        interpreter.HandleCommand('frame variable -R', vars_recursive)
 
         arg_vars = frame.GetVariables(True, False, False, False)
         args_list = []
@@ -209,6 +206,7 @@ def emit_step(debugger, command, result, internal_dict):
             'function': function_name,
             'line': line_entry.GetLine(),
             'vars_raw': vars_result.GetOutput() or '',
+            'vars_recursive': vars_recursive.GetOutput() or '',
             'args': args_list
         }})
 
@@ -242,10 +240,9 @@ def emit_step(debugger, command, result, internal_dict):
                 variables, containers, memory = parse_frame_variables(
                     raw_frame.get("vars_raw", ""),
                     raw_frame.get("line", current_line),
-                    declaration_lines
+                    declaration_lines,
+                    raw_frame.get("vars_recursive", ""),
                 )
-                args = raw_frame.get("args", [])
-                stack_frames[depth]["args"] = args
                 stack_frames[depth]["locals"] = variables
                 stack_frames[depth]["containers"] = containers
                 stack_frames[depth]["memory"] = memory
@@ -254,10 +251,7 @@ def emit_step(debugger, command, result, internal_dict):
                 containers_by_depth[depth] = containers
                 memory_by_depth[depth] = memory
 
-            total_frames = len(stack_frames)
             for depth, frame in enumerate(stack_frames):
-                bottom_index = total_frames - 1 - depth
-                frame["id"] = f"{frame['name']}|{bottom_index}"
                 frame["status"] = "active" if depth == 0 else "waiting"
                 frame["active"] = depth == 0
 
@@ -277,21 +271,22 @@ def emit_step(debugger, command, result, internal_dict):
                 "stack": stack_frames,
                 "containers": merged_containers,
                 "activeContainers": top_frame.get("containers", empty_containers()),
-                "memory": top_frame.get("memory", empty_memory_graph())
+                "memory": merged_memory
             })
 
-        return dedupe_consecutive_steps(steps)
+        return steps
 
     def _parse_stack_frames(self, raw_frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
         frames = []
-        for depth, frame in enumerate(raw_frames):
-            function = frame.get("function", "<anonymous>")
-            name, _ = split_function_signature(function)
+        for depth, raw_frame in enumerate(raw_frames):
+            function = raw_frame.get("function", "<anonymous>")
+            name, sig_args = split_function_signature(function)
+            lldb_args = raw_frame.get("args") or []
             frames.append({
                 "depth": depth,
                 "name": name,
-                "args": [],
-                "line": int(frame.get("line", 0))
+                "args": lldb_args if lldb_args else sig_args,
+                "line": int(raw_frame.get("line", 0))
             })
         return frames
 
@@ -340,20 +335,24 @@ def emit_step(debugger, command, result, internal_dict):
             last_seen = current_seen
 
     def _carry_forward_variables(self, steps: list[dict[str, Any]]) -> None:
+        """Per-frame locals are keyed by frame id (function + stack slot). Active frame is LLDB-authoritative
+        so block-scoped locals disappear when out of scope. Parent frames keep the last snapshot only when
+        LLDB omits locals for non-active frames."""
         last_seen: dict[str, dict[str, Any]] = {}
 
         for step in steps:
             current_seen: dict[str, dict[str, Any]] = {}
             for frame in step["stack"]:
                 frame_id = frame["id"]
+                prev = last_seen.get(frame_id, {})
                 current = {var["name"]: dict(var) for var in frame.get("locals", [])}
 
-                merged = current or {
-                    name: dict(var)
-                    for name, var in last_seen.get(frame_id, {}).items()
-                }
+                if frame.get("active"):
+                    merged = dict(current)
+                else:
+                    merged = dict(current) if current else dict(prev)
 
-                frame["locals"] = list(merged.values())
+                frame["locals"] = sorted(merged.values(), key=lambda v: v["name"])
                 current_seen[frame_id] = merged
 
             last_seen = current_seen
@@ -420,6 +419,15 @@ def emit_step(debugger, command, result, internal_dict):
                             seen_edges.append({"from": parent_key, "to": key})
                 step_nodes.append(key)
                 active_keys.append(key)
+
+            stack = step["stack"]
+            nstack = len(stack)
+            for si, frame in enumerate(stack):
+                path_idx = nstack - 1 - si
+                if path_idx < len(current_keys):
+                    frame["id"] = current_keys[path_idx]
+                else:
+                    frame["id"] = f"{frame.get('name', 'fn')}|orphan|{si}"
 
             prev_keys = current_keys
 
@@ -558,17 +566,18 @@ def format_flow_label(name: str, args: list[str]) -> str:
 
 
 def split_function_signature(raw: str) -> tuple[str, list[str]]:
-    match = re.match(r"^(?P<name>[^(]+)(?P<args>\(.*\))$", raw.strip())
+    """Extract display name and parameter list from an LLDB function string like `fib(int n)` or `main()`."""
+    raw = raw.strip()
+    match = re.match(r"^(?P<name>[^(]+)\((?P<inner>.*)\)$", raw)
     if not match:
-        return raw.strip(), []
+        return raw, []
 
     name = match.group("name").strip()
-    inner = match.group("args")[1:-1].strip()
+    inner = match.group("inner").strip()
     if not inner:
         return name, []
-    args = [item.strip().replace("=", " = ") for item in inner.split(",")]
-    if not any("=" in item for item in args):
-        return name, []
+
+    args = [part.strip().replace("=", " = ") for part in split_top_level(inner, ",") if part.strip()]
     return name, args
 
 
@@ -580,7 +589,8 @@ def dedupe_consecutive_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]
         signature = (
             step["line"],
             json.dumps(step["stack"], sort_keys=True),
-            json.dumps(step["containers"], sort_keys=True)
+            json.dumps(step["containers"], sort_keys=True),
+            json.dumps(step.get("memory") or {}, sort_keys=True),
         )
         if signature != previous_signature:
             deduped.append(step)
@@ -626,15 +636,105 @@ def split_top_level(text: str, delimiter: str) -> list[str]:
     return parts
 
 
+def parse_lldb_frame_var_line(row: str) -> tuple[str, str, str] | None:
+    """Parse `(type) name = value` where `type` may contain parentheses (e.g. libstdc++ basic_string on Linux)."""
+    row = row.strip()
+    if not row.startswith("("):
+        return None
+    depth = 0
+    for i, char in enumerate(row):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                typename = row[1:i].strip()
+                rest = row[i + 1:].strip()
+                match = re.match(r"^([A-Za-z_]\w*)\s*=\s*(.*)$", rest, re.DOTALL)
+                if not match:
+                    return None
+                return typename, match.group(1), match.group(2)
+    return None
+
+
+def make_local(name: str, value: Any, typename: str) -> dict[str, Any]:
+    return {"name": name, "value": value, "type": typename}
+
+
+def lldb_strip_type_prefix(line: str) -> str:
+    """Remove leading `(typename)` tokens LLDB prints with `frame variable -T` / typed children."""
+    s = line.strip()
+    while s.startswith("("):
+        depth = 0
+        i = 0
+        closed = False
+        while i < len(s):
+            if s[i] == "(":
+                depth += 1
+            elif s[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    s = s[i + 1 :].lstrip()
+                    closed = True
+                    break
+            i += 1
+        if not closed:
+            break
+    return s
+
+
+def is_nested_std_vector(typename: str) -> bool:
+    if not is_vector_type(typename):
+        return False
+    return typename.count("vector") >= 2
+
+
+def is_2d_row_major_values(values: Any) -> bool:
+    if not isinstance(values, list) or not values:
+        return False
+    if not all(isinstance(row, list) for row in values):
+        return False
+    return all(not any(isinstance(x, list) for x in row) for row in values)
+
+
+def merge_recursive_vector_heap_edges(
+    memory: dict[str, list[dict[str, str]]],
+    recursive_text: str,
+) -> None:
+    """Pair `frame variable -R` vector headers with the next `__begin_` line (libc++/libstdc++)."""
+    if not recursive_text.strip():
+        return
+    queue: list[str] = []
+    for raw in recursive_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        start = parse_lldb_frame_var_line(line)
+        if start:
+            tn, nm, vt = start
+            if "vector" in tn and vt.rstrip().endswith("{"):
+                queue.append(nm)
+        match = re.search(r"__begin_\s*=\s*(0x[0-9a-fA-F]+)", line)
+        if match and queue:
+            var_name = queue.pop(0)
+            addr = normalize_address(match.group(1))
+            if addr:
+                vid = f"var:{var_name}"
+                add_memory_node(memory, vid, var_name, "variable")
+                add_memory_node(memory, addr, addr, "address")
+                add_memory_edge(memory, vid, addr, "__begin_")
+
+
 def parse_frame_variables(
     text: str,
     current_line: int,
-    declaration_lines: dict[str, int]
+    declaration_lines: dict[str, int],
+    recursive_text: str = "",
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]], dict[str, list[dict[str, str]]]]:
     rows = [
         line.strip("\n")
         for line in text.splitlines()
-        if line.strip() and not line.startswith("(lldb)") and "frame #0:" not in line and "frame #1:" not in line
+        if line.strip() and not line.startswith("(lldb)") and "frame #" not in line
     ]
 
     variables: list[dict[str, Any]] = []
@@ -644,14 +744,12 @@ def parse_frame_variables(
 
     while index < len(rows):
         row = rows[index].strip()
-        start = re.match(r"^\(([^)]+)\)\s+([A-Za-z_]\w*)\s*=\s*(.+)$", row)
+        start = parse_lldb_frame_var_line(row)
         if not start:
             index += 1
             continue
 
-        typename = start.group(1)
-        name = start.group(2)
-        value_text = start.group(3)
+        typename, name, value_text = start
         declaration_line = declaration_lines.get(name, -1)
         if declaration_line > current_line:
             index += 1
@@ -662,9 +760,15 @@ def parse_frame_variables(
             continue
 
         if is_string_type(typename):
-            str_value = value_text.strip('"')
+            vt = value_text.strip()
+            if vt.startswith('"') and vt.endswith('"'):
+                str_value = parse_literal(vt)
+            elif vt.startswith("'") and vt.endswith("'") and len(vt) >= 2:
+                str_value = vt[1:-1]
+            else:
+                str_value = vt.strip('"') or vt
             containers["arrays"].append({"name": name, "kind": "string", "values": list(str_value)})
-            variables.append({"name": name, "value": str_value})
+            variables.append(make_local(name, str_value, typename))
             index += 1
             continue
 
@@ -676,18 +780,41 @@ def parse_frame_variables(
                 else:
                     kind = "unordered_map" if "unordered_map" in typename else "map"
                     containers["maps"].append({"name": name, "kind": kind, "entries": entries})
-                variables.append({"name": name, "value": dict(entries)})
+                variables.append(make_local(name, dict(entries), typename))
+                index = next_index
+                continue
+
+        if is_std_array_type(typename) and value_text == "{":
+            values, next_index = parse_indexed_block(rows, index)
+            if values is not None:
+                containers["arrays"].append({"name": name, "kind": "array", "values": values})
+                variables.append(make_local(name, values, typename))
                 index = next_index
                 continue
 
         if is_vector_type(typename) and value_text.startswith("size="):
             values, next_index = parse_vector(rows, index)
             if values is not None:
-                if is_graph_adjacency_list(values):
+                if is_nested_std_vector(typename) and (not values or is_2d_row_major_values(values)):
+                    containers["arrays"].append({"name": name, "kind": "matrix", "values": values})
+                elif is_graph_adjacency_list(values):
                     containers["graphs"].append({"name": name, "edges": [[i, value] for i, value in enumerate(values)]})
                 else:
                     containers["arrays"].append({"name": name, "kind": "vector", "values": values})
-                variables.append({"name": name, "value": values})
+                variables.append(make_local(name, values, typename))
+                index = next_index
+                continue
+
+        if is_vector_type(typename) and value_text.strip() == "{":
+            values, next_index = parse_vector_curly(rows, index)
+            if values is not None:
+                if is_nested_std_vector(typename) and (not values or is_2d_row_major_values(values)):
+                    containers["arrays"].append({"name": name, "kind": "matrix", "values": values})
+                elif is_graph_adjacency_list(values):
+                    containers["graphs"].append({"name": name, "edges": [[i, value] for i, value in enumerate(values)]})
+                else:
+                    containers["arrays"].append({"name": name, "kind": "vector", "values": values})
+                variables.append(make_local(name, values, typename))
                 index = next_index
                 continue
 
@@ -696,7 +823,7 @@ def parse_frame_variables(
             if values is not None:
                 kind = "unordered_set" if "unordered_set" in typename else "set"
                 containers["sets"].append({"name": name, "kind": kind, "values": values})
-                variables.append({"name": name, "value": values})
+                variables.append(make_local(name, values, typename))
                 index = next_index
                 continue
 
@@ -704,7 +831,7 @@ def parse_frame_variables(
             values, next_index = parse_stack(rows, index)
             if values is not None:
                 containers["stacks"].append({"name": name, "values": values})
-                variables.append({"name": name, "value": values})
+                variables.append(make_local(name, values, typename))
                 index = next_index
                 continue
 
@@ -712,7 +839,7 @@ def parse_frame_variables(
             values, next_index = parse_list(rows, index)
             if values is not None:
                 containers["lists"].append({"name": name, "values": values})
-                variables.append({"name": name, "value": values})
+                variables.append(make_local(name, values, typename))
                 index = next_index
                 continue
 
@@ -720,41 +847,41 @@ def parse_frame_variables(
             values, next_index = parse_deque(rows, index)
             if values is not None:
                 containers["arrays"].append({"name": name, "kind": "deque", "values": values})
-                variables.append({"name": name, "value": values})
+                variables.append(make_local(name, values, typename))
                 index = next_index
                 continue
 
         if is_queue_type(typename):
             if value_text.endswith("{}"):
                 containers["queues"].append({"name": name, "values": []})
-                variables.append({"name": name, "value": []})
+                variables.append(make_local(name, [], typename))
                 index += 1
                 continue
             values, next_index = parse_queue(rows, index)
             if values is not None:
                 containers["queues"].append({"name": name, "values": values})
-                variables.append({"name": name, "value": values})
+                variables.append(make_local(name, values, typename))
                 index = next_index
                 continue
 
         if is_priority_queue_type(typename):
             if value_text.endswith("{}"):
                 containers["priorityQueues"].append({"name": name, "values": []})
-                variables.append({"name": name, "value": []})
+                variables.append(make_local(name, [], typename))
                 index += 1
                 continue
             values, next_index = parse_priority_queue(rows, index)
             if values is not None:
                 containers["priorityQueues"].append({"name": name, "values": values})
-                variables.append({"name": name, "value": values})
+                variables.append(make_local(name, values, typename))
                 index = next_index
                 continue
 
         if is_vector_array_type(typename) and value_text == "{":
             values, next_index = parse_vector_array(rows, index)
             if values is not None:
-                containers["graphs"].append({"name": name, "edges": [[i, value] for i, value in enumerate(values)]})
-                variables.append({"name": name, "value": values})
+                containers["arrays"].append({"name": name, "kind": "matrix", "values": values})
+                variables.append(make_local(name, values, typename))
                 index = next_index
                 continue
 
@@ -765,34 +892,43 @@ def parse_frame_variables(
             if address:
                 add_memory_node(memory, address, f"*{name}", "address")
                 add_memory_edge(memory, variable_id, address, address)
-                variables.append({"name": name, "value": address})
+                variables.append(make_local(name, address, typename))
             elif value_text.strip() in {"nullptr", "null", "0x0"}:
-                variables.append({"name": name, "value": "nullptr"})
-            if value_text.endswith("{") and address:
+                variables.append(make_local(name, "nullptr", typename))
+            if value_text.rstrip().endswith("{") and address:
                 pointer_edges, next_index = parse_pointer_object_block(rows, index, address)
                 for edge in pointer_edges:
                     add_memory_node(memory, edge["to"], edge["to"], "address")
                     add_memory_edge(memory, edge["from"], edge["to"], edge["label"])
                 index = next_index
-                continue
+            else:
+                index += 1
+            continue
 
         if (typename.startswith("std::") or "<" in typename) and (value_text.startswith("size=") or value_text == "{"):
             if value_text.startswith("size="):
                 values, next_index = parse_set(rows, index)
                 if values is not None:
                     containers["unknowns"].append({"name": name, "kind": typename, "values": values})
-                    variables.append({"name": name, "value": values})
+                    variables.append(make_local(name, values, typename))
                     index = next_index
                     continue
             if value_text == "{":
                 values, next_index = parse_indexed_block(rows, index)
                 if values is not None:
                     containers["unknowns"].append({"name": name, "kind": typename, "values": values})
-                    variables.append({"name": name, "value": values})
+                    variables.append(make_local(name, values, typename))
                     index = next_index
                     continue
 
         if value_text.endswith("{"):
+            containers["unknowns"].append({
+                "name": name,
+                "kind": typename,
+                "values": [],
+                "preview": "Expand in Locals or use a supported STL shape"
+            })
+            variables.append(make_local(name, f"⟨{typename}⟩", typename))
             index += 1
             while index < len(rows) and rows[index].strip() != "}":
                 index += 1
@@ -800,14 +936,45 @@ def parse_frame_variables(
             continue
 
         parsed_value = parse_literal(value_text)
-        variables.append({"name": name, "value": parsed_value})
+        variables.append(make_local(name, parsed_value, typename))
         index += 1
 
+    merge_recursive_vector_heap_edges(memory, recursive_text)
     return variables, containers, memory
 
 
+def _parse_vector_children(rows: list[str], index: int) -> tuple[list[Any], int]:
+    values: list[Any] = []
+    while index < len(rows):
+        line = rows[index].strip()
+        stripped = lldb_strip_type_prefix(line)
+        if stripped == "}":
+            return values, index + 1
+        if re.match(r"^\[(\d+)\]\s*=\s*.+?\bsize=error", stripped, re.I):
+            values.append([])
+            index = scan_to_block_end(rows, index)
+            continue
+        if re.match(r"^\[(\d+)\]\s*=\s*.*\bsize=\d+\s*\{\s*$", stripped):
+            nested_values, next_index = parse_nested_size_block(rows, index)
+            values.append(nested_values)
+            index = next_index
+            continue
+        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", stripped)
+        if value_match:
+            values.append(parse_literal(value_match.group(2)))
+        index += 1
+    return values, index
+
+
 def parse_vector(rows: list[str], start_index: int) -> tuple[list[Any] | None, int]:
-    size_match = re.search(r"size=(\d+)", rows[start_index])
+    header = rows[start_index].strip()
+    if re.search(r"size=error", header, re.I):
+        if re.search(r"\{\s*\}", header):
+            return [], start_index + 1
+        return [], scan_to_block_end(rows, start_index)
+    if re.search(r"size=\d+\s*\{\s*\}\s*$", header):
+        return [], start_index + 1
+    size_match = re.search(r"size=(\d+)", header)
     if not size_match:
         return None, start_index + 1
 
@@ -815,24 +982,18 @@ def parse_vector(rows: list[str], start_index: int) -> tuple[list[Any] | None, i
     if size > 2048:
         return None, scan_to_block_end(rows, start_index)
 
-    values = []
-    index = start_index + 1
-    while index < len(rows):
-        line = rows[index].strip()
-        if line == "}":
-            return values, index + 1
-        nested_match = re.match(r"^\[(\d+)\]\s*=\s*size=\d+\s*\{$", line)
-        if nested_match:
-            nested_values, next_index = parse_nested_size_block(rows, index)
-            values.append(nested_values)
-            index = next_index
-            continue
-        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
-        if value_match:
-            values.append(parse_literal(value_match.group(2)))
-        index += 1
+    values, next_i = _parse_vector_children(rows, start_index + 1)
+    return values, next_i
 
-    return values, index
+
+def parse_vector_curly(rows: list[str], start_index: int) -> tuple[list[Any] | None, int]:
+    header = rows[start_index].strip()
+    if not header.rstrip().endswith("{"):
+        return None, start_index + 1
+    if re.search(r"\{\s*\}\s*$", header):
+        return [], start_index + 1
+    values, next_i = _parse_vector_children(rows, start_index + 1)
+    return values, next_i
 
 
 def parse_vector_array(rows: list[str], start_index: int) -> tuple[list[list[Any]] | None, int]:
@@ -840,17 +1001,17 @@ def parse_vector_array(rows: list[str], start_index: int) -> tuple[list[list[Any
     index = start_index + 1
     while index < len(rows):
         line = rows[index].strip()
-        if line == "}":
+        stripped = lldb_strip_type_prefix(line)
+        if stripped == "}":
             return adjacency, index + 1
 
-        nested_match = re.match(r"^\[(\d+)\]\s*=\s*size=\d+\s*\{$", line)
-        if nested_match:
+        if re.match(r"^\[(\d+)\]\s*=\s*.*\bsize=\d+\s*\{\s*$", stripped):
             values, next_index = parse_nested_size_block(rows, index)
             adjacency.append(values)
             index = next_index
             continue
 
-        simple_match = re.match(r"^\[(\d+)\]\s*=\s*\{$", line)
+        simple_match = re.match(r"^\[(\d+)\]\s*=\s*\{\s*$", stripped)
         if simple_match:
             values, next_index = parse_indexed_block(rows, index)
             adjacency.append(values)
@@ -998,10 +1159,8 @@ def parse_queue(rows: list[str], start_index: int) -> tuple[list[Any] | None, in
 
 
 def parse_priority_queue(rows: list[str], start_index: int) -> tuple[list[Any] | None, int]:
-    values, next_index = parse_queue(rows, start_index)
-    if values is None:
-        return None, next_index
-    return sorted(values, reverse=True), next_index
+    """Keep LLDB storage order (underlying heap layout), not a sorted view."""
+    return parse_queue(rows, start_index)
 
 
 def parse_nested_size_block(rows: list[str], start_index: int) -> tuple[list[Any], int]:
@@ -1009,15 +1168,19 @@ def parse_nested_size_block(rows: list[str], start_index: int) -> tuple[list[Any
     index = start_index + 1
     while index < len(rows):
         line = rows[index].strip()
-        if line == "}":
+        stripped = lldb_strip_type_prefix(line)
+        if stripped == "}":
             return values, index + 1
-        nested_match = re.match(r"^\[(\d+)\]\s*=\s*size=\d+\s*\{$", line)
-        if nested_match:
+        if re.match(r"^\[(\d+)\]\s*=\s*.+?\bsize=error", stripped, re.I):
+            values.append([])
+            index = scan_to_block_end(rows, index)
+            continue
+        if re.match(r"^\[(\d+)\]\s*=\s*.*\bsize=\d+\s*\{\s*$", stripped):
             nested_values, next_index = parse_nested_size_block(rows, index)
             values.append(nested_values)
             index = next_index
             continue
-        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", stripped)
         if value_match:
             values.append(parse_literal(value_match.group(2)))
         index += 1
@@ -1029,9 +1192,10 @@ def parse_indexed_block(rows: list[str], start_index: int) -> tuple[list[Any], i
     index = start_index + 1
     while index < len(rows):
         line = rows[index].strip()
-        if line == "}":
+        stripped = lldb_strip_type_prefix(line)
+        if stripped == "}":
             return values, index + 1
-        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", stripped)
         if value_match:
             values.append(parse_literal(value_match.group(2)))
         index += 1
@@ -1043,15 +1207,15 @@ def parse_named_size_block(rows: list[str], start_index: int) -> tuple[list[Any]
     index = start_index + 1
     while index < len(rows):
         line = rows[index].strip()
-        if line == "}":
+        stripped = lldb_strip_type_prefix(line)
+        if stripped == "}":
             return values, index + 1
-        nested_match = re.match(r"^\[(\d+)\]\s*=\s*size=\d+\s*\{$", line)
-        if nested_match:
+        if re.match(r"^\[(\d+)\]\s*=\s*.*\bsize=\d+\s*\{\s*$", stripped):
             nested_values, next_index = parse_nested_size_block(rows, index)
             values.append(nested_values)
             index = next_index
             continue
-        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", line)
+        value_match = re.match(r"^\[(\d+)\]\s*=\s*(.+)$", stripped)
         if value_match:
             values.append(parse_literal(value_match.group(2)))
         index += 1
@@ -1110,8 +1274,12 @@ def is_vector_type(typename: str) -> bool:
     return "std::vector" in typename or typename.startswith("vector<")
 
 
+def is_std_array_type(typename: str) -> bool:
+    return "std::array" in typename or typename.startswith("array<")
+
+
 def is_vector_array_type(typename: str) -> bool:
-    return is_vector_type(typename) and "[" in typename and "]" in typename
+    return is_nested_std_vector(typename)
 
 
 def is_map_type(typename: str) -> bool:
