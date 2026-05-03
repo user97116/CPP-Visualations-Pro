@@ -1,0 +1,27 @@
+{
+  "name": "cpp-flow-studio",
+  "displayName": "C++ Flow Studio",
+  "version": "1.0.8",
+  "engines": { "vscode": "^1.74.0" },
+  "activationEvents": [
+    "onLanguage:cpp",
+    "onCommand:cppFlow.startDebugAndVisualize"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cppFlow.startDebugAndVisualize",
+        "title": "Start Debugging with Flow Studio",
+        "category": "C++ Flow"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "cppFlow.startDebugAndVisualize",
+        "key": "f5",
+        "when": "editorLangId == cpp"
+      }
+    ]
+  }
+}

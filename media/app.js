@@ -1,3 +1,69 @@
+/* ── VS Code Extension Bridge ─────────────────────────── */
+const vscode = (typeof acquireVsCodeApi !== 'undefined') ? acquireVsCodeApi() : null;
+
+if (vscode) {
+  window.addEventListener('message', handleExtensionMessage);
+}
+
+function handleExtensionMessage(event) {
+  const message = event.data;
+  switch (message.type) {
+    case 'loadCode':
+      if (dom.codeEditor) dom.codeEditor.value = message.code;
+      break;
+    case 'traceResult':
+      handleTraceSuccess(message.trace);
+      break;
+    case 'traceError':
+      handleTraceError(message.error);
+      break;
+    case 'traceLoading':
+      dom.traceTitle.textContent = "Compiling and tracing";
+      dom.eventIndicator.textContent = "LLDB backend running...";
+      dom.stepSummary.textContent = "Building your C++ code...";
+      dom.runVisualizer.disabled = true;
+      dom.runVisualizer.textContent = "Tracing...";
+      break;
+  }
+}
+
+function handleTraceSuccess(payload) {
+  state.trace = payload;
+  state.isLoading = false;
+  state.stepIndex = 0;
+  dom.stepSlider.max = Math.max((state.trace?.steps.length || 1) - 1, 0);
+  dom.stepSlider.value = "0";
+  dom.runVisualizer.disabled = false;
+  dom.runVisualizer.textContent = vscode ? "Trace Active File" : "Run visualization";
+
+  const out = (payload.stdout ?? "").trim();
+  if (out) {
+    dom.programOutput.textContent = out;
+    dom.programOutput.className = "output-pre";
+    dom.outputBadge.textContent = `${out.split("\n").length} line${out.split("\n").length !== 1 ? "s" : ""}`;
+  } else {
+    dom.programOutput.textContent = "No output produced.";
+    dom.programOutput.className = "output-pre empty";
+    dom.outputBadge.textContent = "stdout";
+  }
+  render();
+}
+
+function handleTraceError(errorMessage) {
+  state.trace = null;
+  state.isLoading = false;
+  dom.traceTitle.textContent = "Trace failed";
+  dom.eventIndicator.textContent = "Backend or compile error";
+  dom.stepSummary.textContent = errorMessage || "The trace could not be generated.";
+  dom.programOutput.textContent = "No output.";
+  dom.programOutput.className = "output-pre empty";
+  dom.outputBadge.textContent = "stdout";
+  dom.runVisualizer.disabled = false;
+  dom.runVisualizer.textContent = vscode ? "Trace Active File" : "Run visualization";
+  render();
+}
+
+/* ── Original App Logic (unchanged below) ─────────────── */
 const dom = {
   runVisualizer: document.querySelector("#run-visualizer"),
   codeEditor: document.querySelector("#code-editor"),
@@ -50,15 +116,17 @@ const state = {
 initialize();
 
 function initialize() {
-  dom.codeEditor.placeholder = [
-    "#include <iostream>",
-    "",
-    "int main() {",
-    "    int x = 5;",
-    "    std::cout << x << \"\\n\";",
-    "    return 0;",
-    "}"
-  ].join("\n");
+  if (!vscode) {
+    dom.codeEditor.placeholder = [
+      "#include <iostream>",
+      "",
+      "int main() {",
+      "    int x = 5;",
+      "    std::cout << x << \"\\n\";",
+      "    return 0;",
+      "}"
+    ].join("\n");
+  }
   dom.runVisualizer.addEventListener("click", runVisualization);
   dom.prevStep.addEventListener("click", () => moveStep(-1));
   dom.nextStep.addEventListener("click", () => moveStep(1));
@@ -85,13 +153,35 @@ function initialize() {
     dom.toggleFlowList.textContent = state.showFlowList ? "Hide details" : "Show details";
     render();
   });
+  if (!vscode && typeof INITIAL_TRACE !== 'undefined' && INITIAL_TRACE) {
+    handleTraceSuccess(INITIAL_TRACE);
+  }
+  if (vscode) {
+    vscode.postMessage({ type: 'webviewReady' });
+  }
 
   render();
 }
 
 async function runVisualization() {
-  const code = dom.codeEditor.value;
-  if (!code.trim()) {
+  /* VS Code path: ask the extension host to trace the active editor */
+  if (vscode) {
+    state.isLoading = true;
+    state.hiddenVariables.clear();
+    state.hiddenFrames.clear();
+    stopPlayback();
+    dom.runVisualizer.disabled = true;
+    dom.runVisualizer.textContent = "Tracing...";
+    dom.traceTitle.textContent = "Compiling and tracing";
+    dom.eventIndicator.textContent = "LLDB backend running";
+    dom.stepSummary.textContent = "Building your C++ code and capturing source-line execution data.";
+    vscode.postMessage({ type: 'trace' });
+    return;
+  }
+
+  /* Browser fallback (original behaviour) */
+  const code = dom.codeEditor ? dom.codeEditor.value : "";
+    if (!code.trim()) {
     state.trace = null;
     stopPlayback();
     dom.traceTitle.textContent = "Code required";
@@ -114,9 +204,7 @@ async function runVisualization() {
   try {
     const response = await fetch("/api/trace", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code })
     });
 
@@ -124,49 +212,20 @@ async function runVisualization() {
     if (!response.ok) {
       throw new Error(payload.details ? `${payload.error}\n${payload.details}` : payload.error);
     }
-
-    state.trace = payload;
-    const out = (payload.stdout ?? "").trim();
-    if (out) {
-      dom.programOutput.textContent = out;
-      dom.programOutput.className = "output-pre";
-      dom.outputBadge.textContent = `${out.split("\n").length} line${out.split("\n").length !== 1 ? "s" : ""}`;
-    } else {
-      dom.programOutput.textContent = "No output produced.";
-      dom.programOutput.className = "output-pre empty";
-      dom.outputBadge.textContent = "stdout";
-    }
+    handleTraceSuccess(payload);
   } catch (error) {
-    state.trace = null;
-    dom.traceTitle.textContent = "Trace failed";
-    dom.eventIndicator.textContent = "Backend or compile error";
-    dom.stepSummary.textContent = error.message || "The trace could not be generated.";
-    dom.programOutput.textContent = "No output.";
-    dom.programOutput.className = "output-pre empty";
-    dom.outputBadge.textContent = "stdout";
+    handleTraceError(error.message);
     window.console.error(error);
-  } finally {
-    state.isLoading = false;
-    state.stepIndex = 0;
-    dom.stepSlider.max = Math.max((state.trace?.steps.length || 1) - 1, 0);
-    dom.stepSlider.value = "0";
-    dom.runVisualizer.disabled = false;
-    dom.runVisualizer.textContent = "Run visualization";
-    render();
   }
 }
 
 function togglePlayback() {
-  if (!state.trace || state.trace.steps.length === 0) {
-    return;
-  }
-
+  if (!state.trace || state.trace.steps.length === 0) return;
   if (state.playing) {
     stopPlayback();
     render();
     return;
   }
-
   state.playing = true;
   dom.playPause.textContent = "Pause";
   state.playTimer = window.setInterval(() => {
@@ -175,7 +234,6 @@ function togglePlayback() {
       render();
       return;
     }
-
     state.stepIndex += 1;
     dom.stepSlider.value = String(state.stepIndex);
     render();
@@ -190,10 +248,7 @@ function stopPlayback() {
 }
 
 function moveStep(delta) {
-  if (!state.trace) {
-    return;
-  }
-
+  if (!state.trace) return;
   stopPlayback();
   state.stepIndex = clamp(state.stepIndex + delta, 0, state.trace.steps.length - 1);
   dom.stepSlider.value = String(state.stepIndex);
@@ -204,11 +259,20 @@ function render() {
   const trace = state.trace;
   const step = trace?.steps?.[state.stepIndex];
 
+  // VS Code ko batado ki ab kaunsa step active hai (hover value ke liye)
+  if (vscode && step) {
+    vscode.postMessage({
+      type: 'stepChanged',
+      stepIndex: state.stepIndex,
+      step: step
+    });
+  }
+
   dom.traceTitle.textContent = trace ? trace.title : "Real LLDB Trace";
   dom.stepIndicator.textContent = trace ? `${state.stepIndex + 1} / ${trace.steps.length}` : "0 / 0";
   dom.lineIndicator.textContent = step ? `L${step.line}` : "-";
   dom.eventIndicator.textContent = step ? step.event : "Waiting for a run";
-  dom.stepSummary.textContent = step ? step.summary : dom.stepSummary.textContent || "Write your C++ code, then run the visualization to inspect real execution flow.";
+  dom.stepSummary.textContent = step ? step.summary : dom.stepSummary.textContent || "Open a C++ file, then run the visualization to inspect real execution flow.";
   dom.stepSlider.disabled = !trace || state.isLoading;
   dom.surfaceStackCount.textContent = String(step?.stack?.length || 0);
   dom.surfaceFlowCount.textContent = String(step?.tree?.nodes?.length || 0);
@@ -254,12 +318,10 @@ function render() {
 
 function renderCode(trace, step) {
   dom.codeVisual.innerHTML = "";
-
-  const lines = trace ? trace.code.split("\n") : dom.codeEditor.value.split("\n");
+  const lines = trace ? trace.code.split("\n") : (dom.codeEditor?.value || "").split("\n");
   lines.forEach((content, index) => {
     const line = document.createElement("div");
     line.className = "code-line";
-
     if (step) {
       if (index + 1 === step.line) {
         line.classList.add("active");
@@ -267,14 +329,11 @@ function renderCode(trace, step) {
         line.classList.add("done");
       }
     }
-
     const lineNumber = document.createElement("span");
     lineNumber.className = "line-number";
     lineNumber.textContent = String(index + 1);
-
     const lineContent = document.createElement("span");
     lineContent.textContent = content || " ";
-
     line.append(lineNumber, lineContent);
     dom.codeVisual.append(line);
   });
@@ -282,7 +341,6 @@ function renderCode(trace, step) {
 
 function renderStack(step) {
   dom.stackView.innerHTML = "";
-
   if (!step?.stack?.length) {
     dom.stackView.innerHTML = `<div class="empty-state">Run a trace to inspect function frames, locals, and return values.</div>`;
     return;
@@ -292,20 +350,14 @@ function renderStack(step) {
     const frameCard = document.createElement("div");
     frameCard.className = `stack-frame ${frame.active ? "active" : ""}`;
     const frameHidden = state.hiddenFrames.has(frame.id);
-
     const args = frame.args?.length ? frame.args.join(", ") : "no arguments";
     const variables = [...(frame.locals || []), ...(frame.returnValue !== undefined ? [{
-      name: "return",
-      value: frame.returnValue,
-      changed: true,
-      isReturn: true
+      name: "return", value: frame.returnValue, changed: true, isReturn: true
     }] : [])];
 
     const visibleVariables = variables.filter((variable) => {
       const key = getVariableKey(frame.id, variable.name);
-      if (state.hiddenVariables.has(key)) {
-        return true;
-      }
+      if (state.hiddenVariables.has(key)) return true;
       return !dom.filterUnchanged.checked || variable.changed || variable.isReturn;
     });
 
@@ -358,17 +410,13 @@ function renderStack(step) {
       visibleVariables.forEach((variable) => {
         const row = document.createElement("div");
         row.className = "variable-row";
-
         const variableKey = getVariableKey(frame.id, variable.name);
         const hidden = state.hiddenVariables.has(variableKey);
         const chip = document.createElement("div");
         chip.className = `variable-chip ${variable.changed ? "changed" : ""}`;
         chip.innerHTML = hidden
           ? `<div class="hidden-variable">${variable.name} hidden</div>`
-          : `
-            <div class="variable-name">${variable.name}</div>
-            <div class="variable-value">${formatValue(variable.value)}</div>
-          `;
+          : `<div class="variable-name">${variable.name}</div><div class="variable-value">${formatValue(variable.value)}</div>`;
 
         const button = document.createElement("button");
         button.className = "hide-button";
@@ -389,7 +437,6 @@ function renderStack(step) {
 
 function renderFlow(step) {
   dom.flowView.innerHTML = "";
-
   const nodes = step?.tree?.nodes || [];
   const edges = step?.tree?.edges || [];
 
@@ -402,24 +449,15 @@ function renderFlow(step) {
   const parentSet = new Set();
   nodes.forEach((node) => childrenMap.set(node.id, []));
   edges.forEach((edge) => {
-    if (!childrenMap.has(edge.from) || !childrenMap.has(edge.to)) {
-      return;
-    }
+    if (!childrenMap.has(edge.from) || !childrenMap.has(edge.to)) return;
     childrenMap.get(edge.from).push(edge.to);
     parentSet.add(edge.to);
   });
 
-  const roots = nodes
-    .filter((node) => !parentSet.has(node.id))
-    .map((node) => node.id);
+  const roots = nodes.filter((node) => !parentSet.has(node.id)).map((node) => node.id);
+  if (roots.length === 0 && nodes.length > 0) roots.push(nodes[0].id);
 
-  if (roots.length === 0 && nodes.length > 0) {
-    roots.push(nodes[0].id);
-  }
-
-  const NODE_W = 160;
-  const NODE_H = 52;
-  const PAD = 20;
+  const NODE_W = 160, NODE_H = 52, PAD = 20;
   const leafXStep = NODE_W + 24;
   const levelHeight = NODE_H + 48;
   let leafCursor = 0;
@@ -439,7 +477,6 @@ function renderFlow(step) {
       positions.set(nodeId, { x, y: NODE_H / 2 + PAD + depth * levelHeight });
       return { x, maxDepth: depth };
     }
-
     const childLayouts = children.map((childId) => assignNode(childId, depth + 1));
     const minX = Math.min(...childLayouts.map((item) => item.x));
     const maxX = Math.max(...childLayouts.map((item) => item.x));
@@ -466,7 +503,7 @@ function renderFlow(step) {
     const to = positions.get(edge.to);
     if (!from || !to) return "";
     const x1 = from.x, y1 = from.y + NODE_H / 2;
-    const x2 = to.x,   y2 = to.y - NODE_H / 2;
+    const x2 = to.x, y2 = to.y - NODE_H / 2;
     const cy = (y1 + y2) / 2;
     return `<path d="M${x1},${y1} C${x1},${cy} ${x2},${cy} ${x2},${y2}" />`;
   }).join("");
@@ -476,12 +513,10 @@ function renderFlow(step) {
     if (!pos) return "";
     const cls = node.active ? "flow-node active" : `flow-node${node.done ? " done" : ""}`;
     const fnName = escapeHtml(node.function || node.label);
-    const paramText = Array.isArray(node.params) && node.params.length
-      ? node.params.join(", ") : "";
+    const paramText = Array.isArray(node.params) && node.params.length ? node.params.join(", ") : "";
     const compact = paramText.length > 24 ? `${paramText.slice(0, 23)}…` : paramText;
-    const x = pos.x, y = pos.y;
     return `
-      <g class="${cls}" transform="translate(${x},${y})">
+      <g class="${cls}" transform="translate(${pos.x},${pos.y})">
         <rect x="${-NODE_W/2}" y="${-NODE_H/2}" rx="12" ry="12" width="${NODE_W}" height="${NODE_H}" />
         <text y="-6" text-anchor="middle" class="fn-name">${fnName}</text>
         <text y="12" text-anchor="middle" class="fn-args">${escapeHtml(compact)}</text>
@@ -499,8 +534,7 @@ function renderFlow(step) {
     : `<div class="empty-state">Graph section hidden. Use "Show graph" to view recursion tree.</div>`;
 
   const listBlock = state.showFlowList
-    ? `
-    <div class="flow-list">
+    ? `<div class="flow-list">
       ${nodes.map((node) => `
         <div class="node ${node.active ? "active" : ""} ${node.done ? "done" : ""}">
           <div class="node-label">${escapeHtml(node.function || node.label)}</div>
@@ -516,7 +550,6 @@ function renderFlow(step) {
 
 function renderMemory(step) {
   dom.memoryView.innerHTML = "";
-
   if (!step) {
     dom.memoryView.innerHTML = `<div class="empty-state">Run a trace to map pointer addresses as connected nodes.</div>`;
     return;
@@ -532,7 +565,6 @@ function renderMemory(step) {
   }
 
   const CW = 160, CH = 56, HGAP = 24, VGAP = 72, PAD = 20;
-
   const varNodes = nodes.filter(n => n.kind === "variable");
   const addrNodes = nodes.filter(n => n.kind !== "variable");
 
@@ -551,7 +583,7 @@ function renderMemory(step) {
 
   const edgeSvg = edges.map(edge => {
     const x1 = xFor(edge.from), y1 = yFor(edge.from) + CH / 2;
-    const x2 = xFor(edge.to),   y2 = yFor(edge.to) - CH / 2;
+    const x2 = xFor(edge.to), y2 = yFor(edge.to) - CH / 2;
     if (!x1 || !x2) return "";
     const rawLabel = edge.label || "";
     const label = rawLabel.startsWith("0x") && rawLabel.length > 10
@@ -615,14 +647,12 @@ function createContainerCard(name, type, typeClass, isActive) {
 
 function renderContainers(step) {
   dom.containersView.innerHTML = "";
-
   if (!step?.stack?.length) {
     dom.containersView.innerHTML = `<div class="empty-state">Container-aware visuals show only when vector, deque, map, unordered_map, set, unordered_set, stack, queue, priority_queue, list, or graph data is available.</div>`;
     return;
   }
 
   let hasAny = false;
-
   step.stack.forEach((frame, frameIdx) => {
     const containers = normalizeContainers(frame.containers);
     if (countContainers(containers) === 0) return;
@@ -643,7 +673,6 @@ function renderContainers(step) {
     const content = document.createElement("div");
     content.className = "frame-containers-content";
 
-    // Arrays: vector, deque, string
     containers.arrays.forEach((array) => {
       const typeClass = array.kind || "vector";
       const card = createContainerCard(array.name, typeClass, typeClass, frame.active);
@@ -663,7 +692,6 @@ function renderContainers(step) {
       content.append(card);
     });
 
-    // Maps
     containers.maps.forEach((map) => {
       const card = createContainerCard(map.name, map.kind || "map", "map", frame.active);
       const table = document.createElement("div");
@@ -684,7 +712,6 @@ function renderContainers(step) {
       content.append(card);
     });
 
-    // Sets
     containers.sets.forEach((set) => {
       const card = createContainerCard(set.name, set.kind || "set", "set", frame.active);
       const wrap = document.createElement("div");
@@ -703,7 +730,6 @@ function renderContainers(step) {
       content.append(card);
     });
 
-    // Stacks
     containers.stacks.forEach((stack) => {
       const card = createContainerCard(stack.name, "stack", "stack", frame.active);
       const col = document.createElement("div");
@@ -722,7 +748,6 @@ function renderContainers(step) {
       content.append(card);
     });
 
-    // Queues
     containers.queues.forEach((queue) => {
       const card = createContainerCard(queue.name, "queue", "queue", frame.active);
       const row = document.createElement("div");
@@ -750,7 +775,6 @@ function renderContainers(step) {
       content.append(card);
     });
 
-    // Priority Queues
     containers.priorityQueues.forEach((pq) => {
       const card = createContainerCard(pq.name, "priority_queue", "pqueue", frame.active);
       const col = document.createElement("div");
@@ -769,7 +793,6 @@ function renderContainers(step) {
       content.append(card);
     });
 
-    // Lists
     containers.lists.forEach((list) => {
       const card = createContainerCard(list.name, "list", "list", frame.active);
       const row = document.createElement("div");
@@ -794,7 +817,6 @@ function renderContainers(step) {
       content.append(card);
     });
 
-    // Graphs
     containers.graphs.forEach((graph) => {
       const card = createContainerCard(graph.name, "graph", "graph", frame.active);
       const grid = document.createElement("div");
@@ -813,7 +835,6 @@ function renderContainers(step) {
       content.append(card);
     });
 
-    // Unknowns
     containers.unknowns.forEach((unknown) => {
       const card = createContainerCard(unknown.name, unknown.kind || "unknown", "unknown", frame.active);
       const wrap = document.createElement("div");
@@ -865,15 +886,9 @@ function getVariableKey(frameId, variableName) {
 }
 
 function formatValue(value) {
-  if (Array.isArray(value)) {
-    return `[${value.join(", ")}]`;
-  }
-  if (typeof value === "string") {
-    return value;
-  }
-  if (typeof value === "object" && value !== null) {
-    return JSON.stringify(value);
-  }
+  if (Array.isArray(value)) return `[${value.join(", ")}]`;
+  if (typeof value === "string") return value;
+  if (typeof value === "object" && value !== null) return JSON.stringify(value);
   return String(value);
 }
 
@@ -906,34 +921,18 @@ function countContainers(containers) {
 function isCurrentFrameContainer(step, name) {
   const active = normalizeContainers(step?.activeContainers);
   return [
-    ...active.arrays,
-    ...active.maps,
-    ...active.sets,
-    ...active.stacks,
-    ...active.queues,
-    ...active.priorityQueues,
-    ...active.lists,
-    ...active.graphs,
-    ...active.unknowns
+    ...active.arrays, ...active.maps, ...active.sets,
+    ...active.stacks, ...active.queues, ...active.priorityQueues,
+    ...active.lists, ...active.graphs, ...active.unknowns
   ].some((item) => item.name === name);
 }
 
 function getContainerContextLabel(step) {
   const total = countContainers(step?.containers);
   const active = countContainers(step?.activeContainers);
-
-  if (!total) {
-    return "Vector, map, set, stack, graph, list renderers";
-  }
-
-  if (active === total) {
-    return "All visible collections are in the active frame";
-  }
-
-  if (active === 0) {
-    return "Collections carried from parent frames remain visible";
-  }
-
+  if (!total) return "Vector, map, set, stack, graph, list renderers";
+  if (active === total) return "All visible collections are in the active frame";
+  if (active === 0) return "Collections carried from parent frames remain visible";
   return `${active} active-frame, ${total - active} parent-frame collections`;
 }
 

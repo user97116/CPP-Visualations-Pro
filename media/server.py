@@ -1275,4 +1275,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--trace-only":
+        import base64
+        code_input = os.environ.get("CODE_INPUT", "")
+        code = base64.b64decode(code_input).decode("utf-8") if code_input else ""
+        tracer = CppTracer()
+        result = tracer.trace(code)
+        print(json.dumps(result))
+        sys.exit(0)
     main()

@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>C++ Flow Studio</title>
+  <link rel="stylesheet" href="styles.css">
+  <script>
+    /*TRACE_DATA_PLACEHOLDER*/
+  </script>
+</head>
+<body>
+  <div class="app-shell">
+    <div class="workspace-layout">
+      <div class="trace-column">
+        <div class="panel editor-panel">
+          <div class="panel-header">
+            <div>
+              <div class="eyebrow">Source</div>
+              <h2 id="file-name">Active File</h2>
+            </div>
+            <button id="run-visualizer" class="primary-button">Run visualization</button>
+          </div>
+          <textarea id="code-editor" style="display:none;"></textarea>
+          <div class="code-visual" id="code-visual"></div>
+        </div>
+
+        <div class="panel stage-panel">
+          <div class="exec-banner" id="exec-banner">
+            <span class="exec-banner__line" id="exec-banner-line">—</span>
+            <span class="exec-banner__code" id="exec-banner-code">Waiting for trace</span>
+            <span class="exec-banner__event" id="exec-banner-event"></span>
+          </div>
+
+          <div class="panel-header trace-header-panel">
+            <div>
+              <div class="eyebrow" id="trace-title">Real LLDB Trace</div>
+              <h2 id="event-indicator">Waiting for a run</h2>
+            </div>
+            <div class="toggles">
+              <label class="toggle"><input type="checkbox" id="filter-unchanged"> Hide unchanged</label>
+              <label class="toggle"><input type="checkbox" id="focus-mode"> Focus mode</label>
+            </div>
+          </div>
+
+          <div class="progress-card">
+            <div class="panel-header">
+              <div>
+                <div class="eyebrow">Step</div>
+                <strong id="step-indicator">0 / 0</strong>
+              </div>
+              <div id="line-indicator">-</div>
+            </div>
+            <input type="range" id="step-slider" min="0" max="0" value="0">
+            <div class="step-summary" id="step-summary">Trace loaded. Use playback controls to navigate.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="layout">
+        <div class="panel">
+          <div class="eyebrow">Surface</div>
+          <div class="surface-strip">
+            <div class="surface-stat">
+              <span class="eyebrow">Stack depth</span>
+              <strong id="surface-stack-count">0</strong>
+            </div>
+            <div class="surface-stat">
+              <span class="eyebrow">Flow nodes</span>
+              <strong id="surface-flow-count">0</strong>
+            </div>
+            <div class="surface-stat">
+              <span class="eyebrow">Containers</span>
+              <strong id="surface-container-count">0</strong>
+            </div>
+            <div class="surface-stat wide">
+              <span class="eyebrow">Focus</span>
+              <strong id="surface-focus">Ready</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="insights-grid">
+          <div class="subpanel collections-panel">
+            <div class="subpanel-title-row">
+              <h3>Collections</h3>
+              <span id="container-context-label">Vector, map, set, stack, graph, list renderers</span>
+            </div>
+            <div class="containers-view" id="containers-view"></div>
+          </div>
+
+          <div class="subpanel stack-panel">
+            <div class="subpanel-title-row">
+              <h3>Stack</h3>
+              <span>frames</span>
+            </div>
+            <div class="stack-view" id="stack-view"></div>
+          </div>
+
+          <div class="subpanel flow-panel">
+            <div class="subpanel-title-row">
+              <h3>Flow</h3>
+              <div class="flow-controls">
+                <button id="toggle-flow-graph" class="ghost-button small">Hide graph</button>
+                <button id="toggle-flow-list" class="ghost-button small">Hide details</button>
+              </div>
+            </div>
+            <div class="flow-view" id="flow-view"></div>
+          </div>
+
+          <div class="subpanel memory-panel">
+            <div class="subpanel-title-row">
+              <h3>Memory</h3>
+              <button id="visualize-addresses" class="ghost-button small">Visualize</button>
+            </div>
+            <div class="memory-view" id="memory-view"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="playback-dock">
+      <button id="prev-step" class="icon-button">←</button>
+      <button id="play-pause" class="primary-button small">Play</button>
+      <button id="next-step" class="icon-button">→</button>
+    </div>
+
+    <div class="output-panel">
+      <div class="output-panel-header">
+        <h3>Program Output</h3>
+        <span class="output-badge" id="output-badge">stdout</span>
+      </div>
+      <pre class="output-pre empty" id="program-output">No output yet.</pre>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
