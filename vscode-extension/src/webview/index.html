@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>C++ Flow Studio</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+
+<body>
+  <div class="app-shell">
+    <main class="workspace-layout">
+      <aside class="panel insights-panel">
+        <div class="panel-header">
+          <div>
+            <p class="panel-kicker">Signal only</p>
+            <h2>State Surfaces</h2>
+          </div>
+        </div>
+
+
+        <div class="output-panel">
+          <div class="output-panel-header">
+            <h3>Program output</h3>
+            <span class="output-badge" id="output-badge">stdout</span>
+          </div>
+          <pre id="program-output" class="output-pre empty">No output yet.</pre>
+        </div>
+
+        <div class="insights-grid">
+          <div class="subpanel stack-panel">
+            <div class="subpanel-title-row">
+              <h3>Call stack</h3>
+              <span>Hide variables and functions</span>
+            </div>
+            <div id="stack-view" class="stack-view"></div>
+          </div>
+
+          <div class="subpanel flow-panel">
+            <div class="subpanel-title-row">
+              <h3>Recursion flow</h3>
+              <div class="flow-controls">
+                <button id="toggle-flow-graph" class="frame-toggle">Hide graph</button>
+                <button id="toggle-flow-list" class="frame-toggle">Hide details</button>
+              </div>
+            </div>
+            <div id="flow-view" class="flow-view"></div>
+          </div>
+
+          <div class="subpanel memory-panel">
+            <div class="subpanel-title-row">
+              <h3>Address graph</h3>
+              <button id="visualize-addresses" class="icon-button">Visualize</button>
+            </div>
+            <div id="memory-view" class="memory-view"></div>
+          </div>
+
+          <div class="subpanel collections-panel">
+            <div class="subpanel-title-row">
+              <h3>Containers</h3>
+              <span id="container-context-label">Vector, map, set, stack, graph, list</span>
+            </div>
+            <div id="containers-view" class="containers-view"></div>
+          </div>
+        </div>
+
+        <div class="surface-strip">
+          <div class="surface-stat">
+            <span class="status-label">Frames</span>
+            <strong id="surface-stack-count">0</strong>
+          </div>
+          <div class="surface-stat">
+            <span class="status-label">Flow nodes</span>
+            <strong id="surface-flow-count">0</strong>
+          </div>
+          <div class="surface-stat">
+            <span class="status-label">Collections</span>
+            <strong id="surface-container-count">0</strong>
+          </div>
+          <div class="surface-stat wide">
+            <span class="status-label">State focus</span>
+            <strong id="surface-focus">Waiting for a run</strong>
+          </div>
+        </div>
+      </aside>
+
+      <section class="trace-column">
+        <div id="exec-banner" class="exec-banner exec-banner--idle">
+          <span class="exec-banner__line" id="exec-banner-line">—</span>
+          <code class="exec-banner__code" id="exec-banner-code">Waiting for trace</code>
+          <span class="exec-banner__event" id="exec-banner-event"></span>
+        </div>
+
+        <section class="panel trace-header-panel">
+          <div class="panel-header">
+            <div>
+              <p class="panel-kicker">Debugger view</p>
+              <h2 id="trace-title">Real LLDB Trace</h2>
+            </div>
+            <!-- Removed "Run visualization" button as VS Code debugger will control this -->
+          </div>
+        </section>
+
+        <section class="layout">
+          <section class="panel stage-panel">
+            <div class="panel-header">
+              <div>
+                <p class="panel-kicker">Execution</p>
+                <h2>Trace Playback</h2>
+              </div>
+            </div>
+
+            <div class="status-strip">
+              <div>
+                <span class="status-label">Step</span>
+                <strong id="step-indicator">0 / 0</strong>
+              </div>
+              <div>
+                <span class="status-label">Current line</span>
+                <strong id="line-indicator">-</strong>
+              </div>
+              <div>
+                <span class="status-label">Event</span>
+                <strong id="event-indicator">Waiting for a run</strong>
+              </div>
+            </div>
+
+            <div class="progress-card">
+              <input id="step-slider" type="range" min="0" max="0" value="0" />
+              <p id="step-summary" class="step-summary">
+                Run the VS Code debugger to inspect real execution flow.
+              </p>
+            </div>
+
+            <div class="code-visual" id="code-visual"></div>
+          </section>
+
+          <!-- Removed editor-panel -->
+        </section>
+      </section>
+    </main>
+
+    <div class="playback-dock">
+      <button id="prev-step" class="icon-button">Previous</button>
+      <button id="play-pause" class="primary-button small">Play</button>
+      <button id="next-step" class="icon-button">Next</button>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+
+</html>

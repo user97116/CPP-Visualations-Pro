@@ -1,0 +1,105 @@
+{
+  "name": "cpp-flow-studio-debugger",
+  "displayName": "C++ Flow Studio Debugger",
+  "description": "Integrates C++ Flow Studio with VS Code debugger UI.",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:cpp-flow-studio-debugger.startFlowStudio",
+    "onDebugResolve:cpp-flow-studio",
+    "onDebugStart:cpp-flow-studio"
+  ],
+  "main": "./dist/extension.js",
+  "dependencies": {
+    "@vscode/debugadapter": "^1.x",
+    "@vscode/debugprotocol": "^1.x"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "cpp-flow-studio-debugger.startFlowStudio",
+        "title": "Start C++ Flow Studio"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "cpp-flow-studio",
+        "label": "C++ Flow Studio Debugger",
+        "program": "./dist/debugAdapter.js",
+        "runtime": "node",
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the C++ program to debug.",
+                "default": "${workspaceFolder}/a.out"
+              },
+              "args": {
+                "type": "array",
+                "description": "Arguments passed to the program.",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Current working directory for the program.",
+                "default": "${workspaceFolder}"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Automatically stop after launch.",
+                "default": true
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "cpp-flow-studio",
+            "request": "launch",
+            "name": "Launch C++ Flow Studio",
+            "program": "${workspaceFolder}/a.out",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "stopOnEntry": true
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run webpack",
+    "webpack": "webpack --mode production --devtool hidden-source-map",
+    "webpack-dev": "webpack --mode development --watch",
+    "test-compile": "tsc -p ./",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "vscode-test",
+    "postinstall": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.88.0",
+    "@types/mocha": "^10.0.6",
+    "@types/node": "18.x",
+    "@typescript-eslint/eslint-plugin": "^7.4.0",
+    "@typescript-eslint/parser": "^7.4.0",
+    "eslint": "^8.57.0",
+    "typescript": "^4.9.5",
+    "webpack": "^5.91.0",
+    "webpack-cli": "^5.1.4",
+    "node-fetch": "^3.0.0",
+    "@vscode/test-cli": "^0.0.9",
+    "@vscode/test-electron": "^2.3.9"
+  }
+}
