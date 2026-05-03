@@ -4,15 +4,16 @@ const fs = require('fs');
 
 let currentPanel = null;
 let debugTracker = null;
+let stepHistory = [];
+let currentStepIndex = -1;
 
 /* ═══════════════════════════════════════════════════════
-   CppFlowPanel — same as before
+   CppFlowPanel — Clean visualization only
    ═══════════════════════════════════════════════════════ */
 class CppFlowPanel {
   constructor(extensionUri) {
     this.extensionUri = extensionUri;
     this.currentStep = null;
-    this.currentStepIndex = 0;
     this._webviewReady = false;
     this._pendingTrace = null;
 
@@ -29,33 +30,50 @@ class CppFlowPanel {
 
     this.panel.webview.html = this._getHtml();
     this.panel.webview.onDidReceiveMessage(msg => this._handleMessage(msg), undefined, []);
-    this.panel.onDidDispose(() => { this.panel = undefined; });
+    this.panel.onDidDispose(() => { currentPanel = null; });
   }
 
   reveal() {
     if (this.panel) this.panel.reveal(vscode.ViewColumn.Beside);
   }
 
-  setTrace(trace) {
-    if (this._webviewReady && this.panel) {
-      this.panel.webview.postMessage({ type: 'traceResult', trace });
-    } else {
-      this._pendingTrace = trace;
-    }
+  updateStep(step, stepIndex, totalSteps) {
+    if (!this._webviewReady || !this.panel) return;
+    
+    this.currentStep = step;
+    this.panel.webview.postMessage({
+      type: 'stepUpdate',
+      step: step,
+      stepIndex: stepIndex,
+      totalSteps: totalSteps
+    });
+  }
+
+  updateStatus(status, message) {
+    if (!this._webviewReady || !this.panel) return;
+    this.panel.webview.postMessage({
+      type: 'statusUpdate',
+      status: status,
+      message: message
+    });
   }
 
   _handleMessage(message) {
     if (message.type === 'webviewReady') {
       this._webviewReady = true;
-      if (this._pendingTrace && this.panel) {
-        this.panel.webview.postMessage({ type: 'traceResult', trace: this._pendingTrace });
-        this._pendingTrace = null;
+      // Send current state if available
+      if (currentStepIndex >= 0 && stepHistory[currentStepIndex]) {
+        this.updateStep(stepHistory[currentStepIndex], currentStepIndex, stepHistory.length);
       }
       return;
     }
-    if (message.type === 'stepChanged') {
-      this.currentStepIndex = message.stepIndex;
-      this.currentStep = message.step;
+    
+    // Handle slider/manual navigation from panel
+    if (message.type === 'navigateToStep') {
+      currentStepIndex = message.stepIndex;
+      if (stepHistory[currentStepIndex]) {
+        this.updateStep(stepHistory[currentStepIndex], currentStepIndex, stepHistory.length);
+      }
     }
   }
 
@@ -74,86 +92,184 @@ class CppFlowPanel {
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; img-src ${webview.cspSource} blob:; script-src 'nonce-${nonce}';">
   <link href="${styleUri}" rel="stylesheet">
   <title>C++ Flow Studio</title>
+  <style>
+    /* Override for debugger-connected mode */
+    .debugger-mode .editor-panel,
+    .debugger-mode .surface-strip { display: none !important; }
+    
+    .debugger-banner {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 18px;
+      border-radius: 10px;
+      background: rgba(30, 30, 40, 0.92);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--accent);
+      font-size: 0.88rem;
+      margin-bottom: 16px;
+    }
+    
+    .debugger-banner .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+      animation: pulse 1.5s infinite;
+    }
+    
+    .debugger-banner .status-text {
+      color: var(--accent);
+      font-weight: 600;
+    }
+    
+    .debugger-banner .line-info {
+      margin-left: auto;
+      font-family: var(--font-code);
+      color: var(--muted);
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    
+    .step-info-bar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 12px 16px;
+      border-radius: 14px;
+      background: rgba(99, 230, 190, 0.08);
+      border: 1px solid rgba(99, 230, 190, 0.2);
+      margin-bottom: 16px;
+    }
+    
+    .step-info-bar .step-count {
+      font-family: var(--font-code);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    
+    .step-info-bar .event-name {
+      color: var(--text);
+      font-weight: 600;
+    }
+    
+    .step-info-bar .line-num {
+      margin-left: auto;
+      color: var(--muted);
+      font-family: var(--font-code);
+    }
+  </style>
 </head>
-<body>
+<body class="debugger-mode">
   <div class="app-shell">
     <div class="workspace-layout">
       <div class="trace-column">
-        <div class="panel editor-panel">
-          <div class="panel-header">
-            <div><div class="eyebrow">Source</div><h2>Active Editor</h2></div>
-            <button id="run-visualizer" class="primary-button">Connect to Debugger</button>
+        <!-- Debugger Status Banner -->
+        <div class="panel">
+          <div class="debugger-banner" id="debugger-banner">
+            <span class="status-dot"></span>
+            <span class="status-text" id="debug-status">Waiting for debugger...</span>
+            <span class="line-info" id="line-info">No active session</span>
           </div>
-          <div style="margin-top:16px;padding:18px;border-radius:18px;background:rgba(7,14,26,0.9);border:1px solid rgba(142,170,217,0.16);font-family:var(--font-code);font-size:0.9rem;color:var(--muted);min-height:120px;">
-            Start VS Code debugger (F5) for C++, then click <strong>Connect to Debugger</strong> to visualize live execution.
+          
+          <!-- Step Info -->
+          <div class="step-info-bar" id="step-info-bar" style="display:none;">
+            <span class="step-count" id="step-count">Step 0</span>
+            <span class="event-name" id="event-name">-</span>
+            <span class="line-num" id="line-num">Line -</span>
           </div>
-          <div class="hint-row"><span>Auto-synced from VS Code debugger</span></div>
-          <textarea id="code-editor" style="display:none;"></textarea>
+          
+          <!-- Step Slider -->
+          <div class="progress-card" id="progress-card" style="display:none;">
+            <div class="panel-header">
+              <div>
+                <div class="eyebrow">History</div>
+                <strong id="step-indicator">0 / 0</strong>
+              </div>
+            </div>
+            <input type="range" id="step-slider" min="0" max="0" value="0">
+            <div class="step-summary" id="step-summary">Start debugging to see execution flow.</div>
+          </div>
         </div>
-        <div class="panel stage-panel">
-          <div class="exec-banner" id="exec-banner">
-            <span class="exec-banner__line" id="exec-banner-line">—</span>
-            <span class="exec-banner__code" id="exec-banner-code">Waiting for debugger</span>
-            <span class="exec-banner__event" id="exec-banner-event"></span>
-          </div>
+
+        <div class="panel stage-panel" style="min-height:auto;">
           <div class="panel-header trace-header-panel">
-            <div><div class="eyebrow" id="trace-title">Live Debugger</div><h2 id="event-indicator">Not connected</h2></div>
+            <div>
+              <div class="eyebrow" id="trace-title">Real-time Debugger</div>
+              <h2 id="event-indicator">Not connected</h2>
+            </div>
             <div class="toggles">
               <label class="toggle"><input type="checkbox" id="filter-unchanged"> Hide unchanged</label>
               <label class="toggle"><input type="checkbox" id="focus-mode"> Focus mode</label>
             </div>
           </div>
-          <div class="progress-card">
-            <div class="panel-header">
-              <div><div class="eyebrow">Step</div><strong id="step-indicator">0 / 0</strong></div>
-              <div id="line-indicator">-</div>
-            </div>
-            <input type="range" id="step-slider" min="0" max="0" value="0">
-            <div class="step-summary" id="step-summary">Start debugging in VS Code to see live visualization.</div>
-          </div>
-          <div class="code-visual" id="code-visual"></div>
         </div>
       </div>
+
       <div class="layout">
-        <div class="panel">
-          <div class="eyebrow">Surface</div>
-          <div class="surface-strip">
-            <div class="surface-stat"><span class="eyebrow">Stack depth</span><strong id="surface-stack-count">0</strong></div>
-            <div class="surface-stat"><span class="eyebrow">Flow nodes</span><strong id="surface-flow-count">0</strong></div>
-            <div class="surface-stat"><span class="eyebrow">Containers</span><strong id="surface-container-count">0</strong></div>
-            <div class="surface-stat wide"><span class="eyebrow">Focus</span><strong id="surface-focus">Waiting</strong></div>
-          </div>
-        </div>
+        <!-- Surface removed -->
+
         <div class="insights-grid">
           <div class="subpanel collections-panel">
-            <div class="subpanel-title-row"><h3>Collections</h3><span id="container-context-label">Vector, map, set, stack, graph, list renderers</span></div>
+            <div class="subpanel-title-row">
+              <h3>Collections</h3>
+              <span id="container-context-label">Vector, map, set, stack, graph, list renderers</span>
+            </div>
             <div class="containers-view" id="containers-view"></div>
           </div>
+
           <div class="subpanel stack-panel">
-            <div class="subpanel-title-row"><h3>Stack</h3><span>frames</span></div>
+            <div class="subpanel-title-row">
+              <h3>Stack</h3>
+              <span>frames</span>
+            </div>
             <div class="stack-view" id="stack-view"></div>
           </div>
+
           <div class="subpanel flow-panel">
-            <div class="subpanel-title-row"><h3>Flow</h3><div class="flow-controls"><button id="toggle-flow-graph" class="ghost-button small">Hide graph</button><button id="toggle-flow-list" class="ghost-button small">Hide details</button></div></div>
+            <div class="subpanel-title-row">
+              <h3>Flow</h3>
+              <div class="flow-controls">
+                <button id="toggle-flow-graph" class="ghost-button small">Hide graph</button>
+                <button id="toggle-flow-list" class="ghost-button small">Hide details</button>
+              </div>
+            </div>
             <div class="flow-view" id="flow-view"></div>
           </div>
+
           <div class="subpanel memory-panel">
-            <div class="subpanel-title-row"><h3>Memory</h3><button id="visualize-addresses" class="ghost-button small">Visualize</button></div>
+            <div class="subpanel-title-row">
+              <h3>Memory</h3>
+              <button id="visualize-addresses" class="ghost-button small">Visualize</button>
+            </div>
             <div class="memory-view" id="memory-view"></div>
           </div>
         </div>
       </div>
     </div>
-    <div class="playback-dock">
-      <button id="prev-step" class="icon-button" disabled>←</button>
-      <button id="play-pause" class="primary-button small" disabled>Pause</button>
-      <button id="next-step" class="icon-button" disabled>→</button>
+
+    <!-- Playback controls disabled in debugger mode -->
+    <div class="playback-dock" style="opacity:0.5; pointer-events:none;">
+      <button id="prev-step" class="icon-button">←</button>
+      <button id="play-pause" class="primary-button small">Auto</button>
+      <button id="next-step" class="icon-button">→</button>
     </div>
+
     <div class="output-panel">
-      <div class="output-panel-header"><h3>Program Output</h3><span class="output-badge" id="output-badge">stdout</span></div>
+      <div class="output-panel-header">
+        <h3>Program Output</h3>
+        <span class="output-badge" id="output-badge">stdout</span>
+      </div>
       <pre class="output-pre empty" id="program-output">Start debugging to see output.</pre>
     </div>
   </div>
+
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
@@ -168,57 +284,50 @@ function getNonce() {
 }
 
 /* ═══════════════════════════════════════════════════════
-   DebugTracker — VS Code debugger se connect karta hai
+   DebugTracker — VS Code Debugger Integration
    ═══════════════════════════════════════════════════════ */
 class DebugTracker {
   constructor(panel) {
     this.panel = panel;
-    this.steps = [];
-    this.stepIndex = -1;
     this.isTracking = false;
+    this.lastLine = null;
+    this.lastFile = null;
+    this.stepCounter = 0;
     this.disposables = [];
   }
 
   start() {
     if (this.isTracking) return;
     this.isTracking = true;
-    this.steps = [];
-    this.stepIndex = -1;
+    stepHistory = [];
+    currentStepIndex = -1;
+    this.stepCounter = 0;
 
-    // Listen for debug session start
-    this.disposables.push(
-      vscode.debug.onDidStartDebugSession((session) => {
-        console.log('[CppFlow] Debug session started:', session.name);
-        this._notifyPanel('Debugger connected', 'Session started');
-      })
-    );
+    this.panel.updateStatus('Connected', 'Tracking VS Code debugger...');
 
-    // Listen for debug session end
-    this.disposables.push(
-      vscode.debug.onDidTerminateDebugSession((session) => {
-        console.log('[CppFlow] Debug session ended:', session.name);
-        this.isTracking = false;
-        this._notifyPanel('Debugger disconnected', 'Session ended');
-      })
-    );
-
-    // Listen for breakpoint hit / step complete
+    // Track stack changes (when debugger stops at a line)
     this.disposables.push(
       vscode.debug.onDidChangeActiveStackItem(async () => {
         await this._captureState();
       })
     );
 
-    // Listen for stopped event (breakpoint, step, exception)
+    // Track when debugger stops (breakpoint, step complete, etc.)
     this.disposables.push(
-      vscode.debug.onDidReceiveDebugSessionCustomEvent(async (e) => {
-        if (e.event === 'stopped') {
-          await this._captureState();
+      vscode.debug.registerDebugAdapterTrackerFactory('*', {
+        createDebugAdapterTracker(session) {
+          return {
+            onDidSendMessage: async (msg) => {
+              if (msg.type === 'event' && msg.event === 'stopped') {
+                await this._captureState();
+              }
+            }
+          };
         }
       })
     );
 
-    // Also poll when debugger is active
+    // Alternative: Poll when session is active
     this._startPolling();
   }
 
@@ -226,18 +335,32 @@ class DebugTracker {
     this.isTracking = false;
     this.disposables.forEach(d => d.dispose());
     this.disposables = [];
+    this.panel.updateStatus('Disconnected', 'Debugger session ended');
   }
 
   _startPolling() {
-    const interval = setInterval(async () => {
-      if (!this.isTracking) {
-        clearInterval(interval);
-        return;
+    const poll = async () => {
+      if (!this.isTracking) return;
+      
+      const session = vscode.debug.activeDebugSession;
+      if (session) {
+        // Check if stopped (not running)
+        try {
+          const threads = await session.customRequest('threads');
+          for (const thread of threads.threads || []) {
+            if (thread.name !== 'Running') {
+              await this._captureState();
+              break;
+            }
+          }
+        } catch (e) {
+          // Session might be ending
+        }
       }
-      if (vscode.debug.activeDebugSession) {
-        await this._captureState();
-      }
-    }, 100); // Poll every 100ms when debugger is active
+      
+      setTimeout(poll, 50); // 50ms poll
+    };
+    poll();
   }
 
   async _captureState() {
@@ -245,80 +368,146 @@ class DebugTracker {
     if (!session) return;
 
     try {
-      // Get stack trace
-      const stackTrace = await session.customRequest('stackTrace', { threadId: 1 });
-      const frames = stackTrace.stackFrames || [];
+      // Get all threads, find stopped one
+      const threads = await session.customRequest('threads');
+      let stoppedThread = null;
+      
+      for (const thread of threads.threads || []) {
+        // Try to get stack trace for this thread
+        try {
+          const stack = await session.customRequest('stackTrace', { 
+            threadId: thread.id,
+            startFrame: 0,
+            levels: 20
+          });
+          if (stack && stack.stackFrames && stack.stackFrames.length > 0) {
+            stoppedThread = { id: thread.id, frames: stack.stackFrames };
+            break;
+          }
+        } catch (e) {
+          continue;
+        }
+      }
 
-      // Get current line from top frame
+      if (!stoppedThread) return;
+
+      const frames = stoppedThread.frames;
       const topFrame = frames[0];
-      if (!topFrame) return;
-
       const currentLine = topFrame.line;
-      const currentFile = topFrame.source?.path || 'unknown';
+      const currentFile = topFrame.source?.path || topFrame.source?.name || 'unknown';
       const functionName = topFrame.name || 'unknown';
 
-      // Get variables for each frame
+      // Skip if same line (duplicate)
+      if (this.lastLine === currentLine && this.lastFile === currentFile) {
+        return;
+      }
+      this.lastLine = currentLine;
+      this.lastFile = currentFile;
+
+      this.stepCounter++;
+
+      // Build stack data with variables
       const stackData = [];
-      for (let i = 0; i < Math.min(frames.length, 5); i++) {
+      for (let i = 0; i < Math.min(frames.length, 10); i++) {
         const frame = frames[i];
-        const frameId = frame.id;
-
-        // Get scopes for this frame
-        const scopes = await session.customRequest('scopes', { frameId });
-        const scope = scopes.scopes[0]; // Usually Local scope
-
-        // Get variables in this scope
-        const vars = await session.customRequest('variables', { variablesReference: scope.variablesReference });
+        const frameLocals = await this._getFrameVariables(session, frame.id, i);
         
-        const locals = vars.variables.map(v => ({
-          name: v.name,
-          value: v.value,
-          type: v.type,
-          changed: false // We'll track this manually
-        }));
-
         stackData.push({
           id: `${frame.name}|${i}`,
           name: frame.name,
           line: frame.line,
+          file: frame.source?.path || 'unknown',
           active: i === 0,
           status: i === 0 ? 'active' : 'waiting',
-          locals: locals,
+          locals: frameLocals,
           args: []
         });
       }
 
-      // Build step data
+      // Build step
       const step = {
         line: currentLine,
-        event: `Execute line ${currentLine} in ${functionName}`,
+        file: currentFile,
+        event: this._describeEvent(functionName, currentLine),
         summary: `${functionName} at line ${currentLine}`,
         stdout: '',
         stack: stackData,
         containers: this._extractContainers(stackData),
         activeContainers: this._extractContainers([stackData[0]]),
         memory: { nodes: [], edges: [] },
-        tree: this._buildFlowTree(stackData, currentLine)
+        tree: this._buildFlowTree(stackData)
       };
 
-      // Check if this is a new step (different line)
-      const lastStep = this.steps[this.steps.length - 1];
-      if (!lastStep || lastStep.line !== currentLine) {
-        this.steps.push(step);
-        this.stepIndex = this.steps.length - 1;
-        
-        // Mark changed variables
-        if (lastStep) {
-          this._markChangedValues(lastStep, step);
-        }
-
-        // Send to panel
-        this._sendToPanel();
+      // Mark changes
+      if (currentStepIndex >= 0 && stepHistory[currentStepIndex]) {
+        this._markChangedValues(stepHistory[currentStepIndex], step);
       }
 
+      // Add to history
+      stepHistory.push(step);
+      currentStepIndex = stepHistory.length - 1;
+
+      // Update panel
+      this.panel.updateStep(step, currentStepIndex, stepHistory.length);
+
+      // Highlight line in editor (optional - VS Code already does this)
+      // But we can add custom decoration if needed
+
     } catch (err) {
-      console.error('[CppFlow] Debug capture error:', err.message);
+      console.error('[CppFlow] Capture error:', err.message);
     }
+  }
+
+  async _getFrameVariables(session, frameId, frameIndex) {
+    const locals = [];
+    
+    try {
+      // Get scopes
+      const scopes = await session.customRequest('scopes', { frameId });
+      
+      for (const scope of scopes.scopes || []) {
+        if (!scope.expensive) { // Skip expensive scopes
+          const vars = await session.customRequest('variables', {
+            variablesReference: scope.variablesReference
+          });
+          
+          for (const v of vars.variables || []) {
+            // Handle nested variables (objects, arrays)
+            let value = v.value;
+            let children = [];
+            
+            if (v.variablesReference > 0) {
+              try {
+                const childVars = await session.customRequest('variables', {
+                  variablesReference: v.variablesReference
+                });
+                children = childVars.variables.map(cv => ({
+                  name: cv.name,
+                  value: cv.value,
+                  type: cv.type
+                }));
+              } catch (e) {}
+            }
+            
+            locals.push({
+              name: v.name,
+              value: value,
+              type: v.type || 'unknown',
+              changed: false,
+              children: children
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`[CppFlow] Var error frame ${frameIndex}:`, e.message);
+    }
+    
+    return locals;
+  }
+
+  _describeEvent(functionName, line) {
+    return `${functionName}() line ${line}`;
   }
 
   _extractContainers(stackData) {
@@ -329,77 +518,132 @@ class DebugTracker {
 
     for (const frame of stackData) {
       for (const local of frame.locals || []) {
-        const type = local.type || '';
+        const type = (local.type || '').toLowerCase();
         const value = local.value || '';
+        const name = local.name;
 
-        // Try to detect container types from debugger output
-        if (type.includes('vector') || type.includes('std::vector')) {
-          const values = this._parseArrayValue(value);
-          containers.arrays.push({ name: local.name, kind: 'vector', values });
-        } else if (type.includes('map') || type.includes('std::map')) {
-          const entries = this._parseMapValue(value);
-          containers.maps.push({ name: local.name, kind: 'map', entries });
-        } else if (type.includes('set') || type.includes('std::set')) {
-          const values = this._parseArrayValue(value);
-          containers.sets.push({ name: local.name, kind: 'set', values });
-        } else if (type.includes('stack') || type.includes('std::stack')) {
-          const values = this._parseArrayValue(value);
-          containers.stacks.push({ name: local.name, values });
+        // Vector / Array
+        if (type.includes('vector') || type.includes('array') || type.includes('[]')) {
+          const values = this._parseContainerValues(value, local.children);
+          containers.arrays.push({ name, kind: 'vector', values });
         }
-        // Add more container types as needed
+        // Map
+        else if (type.includes('map') || type.includes('dictionary')) {
+          const entries = this._parseMapEntries(value, local.children);
+          containers.maps.push({ name, kind: 'map', entries });
+        }
+        // Set
+        else if (type.includes('set') && !type.includes('unordered_set')) {
+          const values = this._parseContainerValues(value, local.children);
+          containers.sets.push({ name, kind: 'set', values });
+        }
+        // Stack
+        else if (type.includes('stack')) {
+          const values = this._parseContainerValues(value, local.children);
+          containers.stacks.push({ name, values });
+        }
+        // Queue
+        else if (type.includes('queue') && !type.includes('priority')) {
+          const values = this._parseContainerValues(value, local.children);
+          containers.queues.push({ name, values });
+        }
+        // Priority Queue
+        else if (type.includes('priority_queue')) {
+          const values = this._parseContainerValues(value, local.children);
+          containers.priorityQueues.push({ name, values });
+        }
+        // List
+        else if (type.includes('list') && !type.includes('initializer')) {
+          const values = this._parseContainerValues(value, local.children);
+          containers.lists.push({ name, values });
+        }
+        // Graph (adjacency list/map)
+        else if (type.includes('graph') || (local.children && this._looksLikeGraph(local.children))) {
+          const edges = this._parseGraphEdges(local.children);
+          containers.graphs.push({ name, edges });
+        }
+        // Pointer / Memory
+        else if (type.includes('*') || type.includes('ptr') || value.includes('0x')) {
+          // Handled in memory view
+        }
       }
     }
 
     return containers;
   }
 
-  _parseArrayValue(valueStr) {
-    // Parse debugger output like "{1, 2, 3}" or "[1, 2, 3]"
-    try {
-      const match = valueStr.match(/[\{\[](.+)[\}\]]/);
-      if (!match) return [];
-      return match[1].split(',').map(s => s.trim()).filter(s => s);
-    } catch {
-      return [];
+  _parseContainerValues(valueStr, children) {
+    if (children && children.length > 0) {
+      return children.map(c => c.value || c.name);
     }
-  }
-
-  _parseMapValue(valueStr) {
+    // Try to parse from string like "{1, 2, 3}" or "[1] = 5, [2] = 10"
     try {
-      const entries = [];
-      const match = valueStr.match(/[\{\[](.+)[\}\]]/);
-      if (!match) return [];
-      const pairs = match[1].split(',');
-      for (const pair of pairs) {
-        const [key, val] = pair.split(':').map(s => s.trim());
-        if (key && val) entries.push([key, val]);
+      const values = [];
+      // Match array elements
+      const matches = valueStr.matchAll(/\[\d+\]\s*=\s*([^,]+)/g);
+      for (const m of matches) {
+        values.push(m[1].trim());
       }
-      return entries;
+      if (values.length > 0) return values;
+      
+      // Match {a, b, c} format
+      const braceMatch = valueStr.match(/\{(.+)\}/);
+      if (braceMatch) {
+        return braceMatch[1].split(',').map(s => s.trim()).filter(s => s);
+      }
+      
+      return [valueStr];
     } catch {
-      return [];
+      return [valueStr];
     }
   }
 
-  _buildFlowTree(stackData, currentLine) {
+  _parseMapEntries(valueStr, children) {
+    if (children && children.length > 0) {
+      return children.map(c => {
+        const parts = (c.value || '').split(':').map(s => s.trim());
+        return parts.length === 2 ? parts : [c.name, c.value];
+      });
+    }
+    return [];
+  }
+
+  _looksLikeGraph(children) {
+    // Check if children look like adjacency list
+    return children.some(c => c.value && c.value.includes('->'));
+  }
+
+  _parseGraphEdges(children) {
+    return children.map(c => {
+      const neighbors = (c.value || '').split(/[,;]/).map(s => s.trim()).filter(s => s);
+      return [c.name, neighbors];
+    });
+  }
+
+  _buildFlowTree(stackData) {
     const nodes = [];
     const edges = [];
+    const nodeIds = new Set();
 
     for (let i = 0; i < stackData.length; i++) {
       const frame = stackData[i];
-      const nodeId = `${frame.name}@${frame.line}`;
+      const nodeId = `${frame.name}#${i}`;
       
-      nodes.push({
-        id: nodeId,
-        label: `${frame.name}()`,
-        function: frame.name,
-        params: frame.args,
-        meta: `line ${frame.line}`,
-        active: i === 0,
-        done: false
-      });
+      if (!nodeIds.has(nodeId)) {
+        nodeIds.add(nodeId);
+        nodes.push({
+          id: nodeId,
+          label: `${frame.name}()`,
+          function: frame.name,
+          params: frame.args || [],
+          meta: `line ${frame.line}`,
+          active: i === 0,
+          done: false
+        });
+      }
 
       if (i > 0) {
-        const parentId = `${stackData[i-1].name}@${stackData[i-1].line}`;
+        const parentId = `${stackData[i-1].name}#${i-1}`;
         edges.push({ from: parentId, to: nodeId });
       }
     }
@@ -423,110 +667,86 @@ class DebugTracker {
       }
     }
   }
-
-  _sendToPanel() {
-    if (!this.panel || !this.panel.panel) return;
-
-    const trace = {
-      title: 'Live VS Code Debugger',
-      code: this._getActiveEditorCode(),
-      stdout: '',
-      steps: this.steps
-    };
-
-    this.panel.panel.webview.postMessage({
-      type: 'traceResult',
-      trace: trace
-    });
-  }
-
-  _notifyPanel(event, message) {
-    if (!this.panel || !this.panel.panel) return;
-    this.panel.panel.webview.postMessage({
-      type: 'debugStatus',
-      event: event,
-      message: message
-    });
-  }
-
-  _getActiveEditorCode() {
-    const editor = vscode.window.activeTextEditor;
-    return editor ? editor.document.getText() : '';
-  }
 }
 
 /* ═══════════════════════════════════════════════════════
    Activation
    ═══════════════════════════════════════════════════════ */
 function activate(context) {
-  // Create panel command
+  // Open panel command
   const openPanelCmd = vscode.commands.registerCommand('cppFlow.openPanel', () => {
     if (!currentPanel) {
       currentPanel = new CppFlowPanel(context.extensionUri);
-      currentPanel.panel.onDidDispose(() => { currentPanel = null; });
     } else {
       currentPanel.reveal();
     }
   });
 
-  // Connect to debugger command
-  const connectCmd = vscode.commands.registerCommand('cppFlow.connectDebugger', async () => {
-    if (!currentPanel) {
-      currentPanel = new CppFlowPanel(context.extensionUri);
-      currentPanel.panel.onDidDispose(() => { currentPanel = null; });
-    }
-
-    // Check if debugger is running
-    if (!vscode.debug.activeDebugSession) {
-      vscode.window.showWarningMessage('Pehle VS Code debugger start karo (F5), phir connect karo.');
-      return;
-    }
-
-    if (debugTracker) {
-      debugTracker.stop();
-    }
-
-    debugTracker = new DebugTracker(currentPanel);
-    debugTracker.start();
-
-    vscode.window.showInformationMessage('C++ Flow Studio connected to VS Code debugger!');
-  });
-
-  // Auto-connect when debugger starts
+  // Auto-open panel when debugger starts
   context.subscriptions.push(
-    vscode.debug.onDidStartDebugSession(() => {
-      if (currentPanel && !debugTracker) {
+    vscode.debug.onDidStartDebugSession((session) => {
+      console.log('[CppFlow] Debugger started:', session.name);
+      
+      if (!currentPanel) {
+        currentPanel = new CppFlowPanel(context.extensionUri);
+      }
+      
+      // Small delay to let debugger initialize
+      setTimeout(() => {
+        if (debugTracker) debugTracker.stop();
         debugTracker = new DebugTracker(currentPanel);
         debugTracker.start();
-      }
+      }, 500);
     })
   );
 
-  // Clean up when debugger stops
+  // Stop tracking when debugger ends
   context.subscriptions.push(
     vscode.debug.onDidTerminateDebugSession(() => {
+      console.log('[CppFlow] Debugger ended');
       if (debugTracker) {
         debugTracker.stop();
         debugTracker = null;
       }
+      if (currentPanel) {
+        currentPanel.updateStatus('Disconnected', 'Debugger session ended');
+      }
     })
   );
 
-  // Hover provider
+  // Track debug session changes
+  context.subscriptions.push(
+    vscode.debug.onDidChangeActiveDebugSession((session) => {
+      if (session && currentPanel) {
+        currentPanel.updateStatus('Connected', `Session: ${session.name}`);
+      }
+    })
+  );
+
+  // Hover provider for variable values
   context.subscriptions.push(
     vscode.languages.registerHoverProvider('cpp', {
       provideHover(document, position) {
-        if (!currentPanel || !currentPanel.currentStep) return;
+        if (!currentPanel || currentStepIndex < 0) return;
+        
         const wordRange = document.getWordRangeAtPosition(position);
         if (!wordRange) return;
         const word = document.getText(wordRange);
-        const step = currentPanel.currentStep;
+        
+        const step = stepHistory[currentStepIndex];
+        if (!step) return;
 
         for (const frame of step.stack || []) {
           for (const local of frame.locals || []) {
             if (local.name === word) {
               const md = new vscode.MarkdownString();
-              md.appendCodeblock(`${local.name} = ${JSON.stringify(local.value)}`, 'cpp');
+              md.appendCodeblock(`${local.name}: ${local.type} = ${local.value}`, 'cpp');
+              if (local.children && local.children.length > 0) {
+                md.appendMarkdown('\n\n**Elements:**\n');
+                for (const child of local.children.slice(0, 10)) {
+                  md.appendMarkdown(`- \`${child.name}\`: ${child.value}\n`);
+                }
+              }
               md.appendMarkdown(`\n\n*Frame:* \`${frame.name}\`  |  *Line:* ${step.line}`);
               md.isTrusted = true;
               return new vscode.Hover(md, wordRange);
@@ -538,7 +758,7 @@ function activate(context) {
     })
   );
 
-  context.subscriptions.push(openPanelCmd, connectCmd);
+  context.subscriptions.push(openPanelCmd);
 }
 
 function deactivate() {
