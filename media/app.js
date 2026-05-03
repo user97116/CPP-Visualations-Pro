@@ -24,6 +24,12 @@ function handleExtensionMessage(event) {
       dom.runVisualizer.disabled = true;
       dom.runVisualizer.textContent = "Tracing...";
       break;
+    case 'debugStatus':
+      // New: Live debugger status updates
+      dom.traceTitle.textContent = "Live VS Code Debugger";
+      dom.eventIndicator.textContent = message.event || "Connected";
+      dom.stepSummary.textContent = message.message || "Tracking execution...";
+      break;
   }
 }
 

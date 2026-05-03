@@ -1,103 +1,12 @@
 const vscode = require('vscode');
-const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
 let currentPanel = null;
+let debugTracker = null;
 
 /* ═══════════════════════════════════════════════════════
-   Python finder
-   ═══════════════════════════════════════════════════════ */
-function findPython() {
-  const candidates = process.platform === 'win32'
-    ? ['python', 'py', 'python3']
-    : ['python3', 'python'];
-  for (const cmd of candidates) {
-    try {
-      require('child_process').execSync(`${cmd} --version`, { encoding: 'utf8', timeout: 5000 });
-      return cmd;
-    } catch (e) { continue; }
-  }
-  return null;
-}
-
-/* ═══════════════════════════════════════════════════════
-   Direct trace — no HTTP server, uses --trace-only
-   ═══════════════════════════════════════════════════════ */
-async function runDirectTrace(code, extensionUri) {
-  const pythonCmd = findPython();
-  if (!pythonCmd) {
-    throw new Error('Python nahi mila. python3 ya python install karo.');
-  }
-
-  const serverPath = path.join(extensionUri.fsPath, 'media', 'server.py');
-  if (!fs.existsSync(serverPath)) {
-    throw new Error(`server.py nahi mila: ${serverPath}`);
-  }
-
-  return new Promise((resolve, reject) => {
-    const proc = spawn(pythonCmd, [serverPath, '--trace-only'], {
-      env: {
-        ...process.env,
-        CODE_INPUT: Buffer.from(code).toString('base64')
-      },
-      cwd: path.join(extensionUri.fsPath, 'media'),
-      timeout: 60000
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    proc.stdout.on('data', (d) => {
-      stdout += d.toString();
-      console.log(`[CppFlow stdout] ${d.toString().trim()}`);
-    });
-
-    proc.stderr.on('data', (d) => {
-      stderr += d.toString();
-      console.error(`[CppFlow stderr] ${d.toString().trim()}`);
-    });
-
-    proc.on('error', (err) => {
-      reject(new Error(`Process failed to start: ${err.message}`));
-    });
-
-    proc.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(
-          `Trace failed (exit code ${code}).\n\n` +
-          `STDERR:\n${stderr || '(empty)'}\n\n` +
-          `STDOUT:\n${stdout.slice(0, 500) || '(empty)'}`
-        ));
-        return;
-      }
-
-      try {
-        // Find JSON in output (ignore any prefix text)
-        const jsonStart = stdout.indexOf('{');
-        const jsonEnd = stdout.lastIndexOf('}');
-        if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
-          reject(new Error(`No JSON found in output.\nOutput: ${stdout.slice(0, 500)}`));
-          return;
-        }
-        const jsonStr = stdout.slice(jsonStart, jsonEnd + 1);
-        const result = JSON.parse(jsonStr);
-
-        if (result.error) {
-          reject(new Error(result.details ? `${result.error}\n${result.details}` : result.error));
-          return;
-        }
-
-        resolve(result);
-      } catch (e) {
-        reject(new Error(`Parse error: ${e.message}\nOutput: ${stdout.slice(0, 500)}`));
-      }
-    });
-  });
-}
-
-/* ═══════════════════════════════════════════════════════
-   CppFlowPanel
+   CppFlowPanel — same as before
    ═══════════════════════════════════════════════════════ */
 class CppFlowPanel {
   constructor(extensionUri) {
@@ -106,7 +15,6 @@ class CppFlowPanel {
     this.currentStepIndex = 0;
     this._webviewReady = false;
     this._pendingTrace = null;
-    this._pendingCode = null;
 
     this.panel = vscode.window.createWebviewPanel(
       'cppFlow',
@@ -115,9 +23,7 @@ class CppFlowPanel {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [
-          vscode.Uri.joinPath(extensionUri, 'media')
-        ]
+        localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')]
       }
     );
 
@@ -130,52 +36,26 @@ class CppFlowPanel {
     if (this.panel) this.panel.reveal(vscode.ViewColumn.Beside);
   }
 
-  setTrace(trace, code) {
+  setTrace(trace) {
     if (this._webviewReady && this.panel) {
       this.panel.webview.postMessage({ type: 'traceResult', trace });
-      if (code !== undefined) this.panel.webview.postMessage({ type: 'loadCode', code });
     } else {
       this._pendingTrace = trace;
-      this._pendingCode = code;
     }
   }
 
-  async _handleMessage(message) {
+  _handleMessage(message) {
     if (message.type === 'webviewReady') {
       this._webviewReady = true;
       if (this._pendingTrace && this.panel) {
         this.panel.webview.postMessage({ type: 'traceResult', trace: this._pendingTrace });
-        if (this._pendingCode !== undefined) {
-          this.panel.webview.postMessage({ type: 'loadCode', code: this._pendingCode });
-        }
         this._pendingTrace = null;
-        this._pendingCode = null;
       }
       return;
     }
-
     if (message.type === 'stepChanged') {
       this.currentStepIndex = message.stepIndex;
       this.currentStep = message.step;
-      return;
-    }
-
-    if (message.type !== 'trace') return;
-
-    try {
-      const editor = vscode.window.activeTextEditor;
-      const code = editor ? editor.document.getText() : '';
-      if (!code.trim()) {
-        this.panel.webview.postMessage({ type: 'traceError', error: 'Koi .cpp file open nahi hai.' });
-        return;
-      }
-
-      this.panel.webview.postMessage({ type: 'traceLoading' });
-      const trace = await runDirectTrace(code, this.extensionUri);
-      this.panel.webview.postMessage({ type: 'traceResult', trace });
-      this.panel.webview.postMessage({ type: 'loadCode', code });
-    } catch (err) {
-      this.panel.webview.postMessage({ type: 'traceError', error: err.message || 'Trace failed' });
     }
   }
 
@@ -202,22 +82,22 @@ class CppFlowPanel {
         <div class="panel editor-panel">
           <div class="panel-header">
             <div><div class="eyebrow">Source</div><h2>Active Editor</h2></div>
-            <button id="run-visualizer" class="primary-button">Trace Active File</button>
+            <button id="run-visualizer" class="primary-button">Connect to Debugger</button>
           </div>
           <div style="margin-top:16px;padding:18px;border-radius:18px;background:rgba(7,14,26,0.9);border:1px solid rgba(142,170,217,0.16);font-family:var(--font-code);font-size:0.9rem;color:var(--muted);min-height:120px;">
-            Code auto-synced from VS Code. Click <strong>Trace Active File</strong> to visualize.
+            Start VS Code debugger (F5) for C++, then click <strong>Connect to Debugger</strong> to visualize live execution.
           </div>
-          <div class="hint-row"><span>Auto-synced from VS Code active editor</span></div>
+          <div class="hint-row"><span>Auto-synced from VS Code debugger</span></div>
           <textarea id="code-editor" style="display:none;"></textarea>
         </div>
         <div class="panel stage-panel">
           <div class="exec-banner" id="exec-banner">
             <span class="exec-banner__line" id="exec-banner-line">—</span>
-            <span class="exec-banner__code" id="exec-banner-code">Waiting for trace</span>
+            <span class="exec-banner__code" id="exec-banner-code">Waiting for debugger</span>
             <span class="exec-banner__event" id="exec-banner-event"></span>
           </div>
           <div class="panel-header trace-header-panel">
-            <div><div class="eyebrow" id="trace-title">Real LLDB Trace</div><h2 id="event-indicator">Waiting for a run</h2></div>
+            <div><div class="eyebrow" id="trace-title">Live Debugger</div><h2 id="event-indicator">Not connected</h2></div>
             <div class="toggles">
               <label class="toggle"><input type="checkbox" id="filter-unchanged"> Hide unchanged</label>
               <label class="toggle"><input type="checkbox" id="focus-mode"> Focus mode</label>
@@ -229,7 +109,7 @@ class CppFlowPanel {
               <div id="line-indicator">-</div>
             </div>
             <input type="range" id="step-slider" min="0" max="0" value="0">
-            <div class="step-summary" id="step-summary">Open a C++ file and run the visualizer.</div>
+            <div class="step-summary" id="step-summary">Start debugging in VS Code to see live visualization.</div>
           </div>
           <div class="code-visual" id="code-visual"></div>
         </div>
@@ -265,13 +145,13 @@ class CppFlowPanel {
       </div>
     </div>
     <div class="playback-dock">
-      <button id="prev-step" class="icon-button">←</button>
-      <button id="play-pause" class="primary-button small">Play</button>
-      <button id="next-step" class="icon-button">→</button>
+      <button id="prev-step" class="icon-button" disabled>←</button>
+      <button id="play-pause" class="primary-button small" disabled>Pause</button>
+      <button id="next-step" class="icon-button" disabled>→</button>
     </div>
     <div class="output-panel">
       <div class="output-panel-header"><h3>Program Output</h3><span class="output-badge" id="output-badge">stdout</span></div>
-      <pre class="output-pre empty" id="program-output">No output yet.</pre>
+      <pre class="output-pre empty" id="program-output">Start debugging to see output.</pre>
     </div>
   </div>
   <script nonce="${nonce}" src="${scriptUri}"></script>
@@ -288,9 +168,350 @@ function getNonce() {
 }
 
 /* ═══════════════════════════════════════════════════════
+   DebugTracker — VS Code debugger se connect karta hai
+   ═══════════════════════════════════════════════════════ */
+class DebugTracker {
+  constructor(panel) {
+    this.panel = panel;
+    this.steps = [];
+    this.stepIndex = -1;
+    this.isTracking = false;
+    this.disposables = [];
+  }
+
+  start() {
+    if (this.isTracking) return;
+    this.isTracking = true;
+    this.steps = [];
+    this.stepIndex = -1;
+
+    // Listen for debug session start
+    this.disposables.push(
+      vscode.debug.onDidStartDebugSession((session) => {
+        console.log('[CppFlow] Debug session started:', session.name);
+        this._notifyPanel('Debugger connected', 'Session started');
+      })
+    );
+
+    // Listen for debug session end
+    this.disposables.push(
+      vscode.debug.onDidTerminateDebugSession((session) => {
+        console.log('[CppFlow] Debug session ended:', session.name);
+        this.isTracking = false;
+        this._notifyPanel('Debugger disconnected', 'Session ended');
+      })
+    );
+
+    // Listen for breakpoint hit / step complete
+    this.disposables.push(
+      vscode.debug.onDidChangeActiveStackItem(async () => {
+        await this._captureState();
+      })
+    );
+
+    // Listen for stopped event (breakpoint, step, exception)
+    this.disposables.push(
+      vscode.debug.onDidReceiveDebugSessionCustomEvent(async (e) => {
+        if (e.event === 'stopped') {
+          await this._captureState();
+        }
+      })
+    );
+
+    // Also poll when debugger is active
+    this._startPolling();
+  }
+
+  stop() {
+    this.isTracking = false;
+    this.disposables.forEach(d => d.dispose());
+    this.disposables = [];
+  }
+
+  _startPolling() {
+    const interval = setInterval(async () => {
+      if (!this.isTracking) {
+        clearInterval(interval);
+        return;
+      }
+      if (vscode.debug.activeDebugSession) {
+        await this._captureState();
+      }
+    }, 100); // Poll every 100ms when debugger is active
+  }
+
+  async _captureState() {
+    const session = vscode.debug.activeDebugSession;
+    if (!session) return;
+
+    try {
+      // Get stack trace
+      const stackTrace = await session.customRequest('stackTrace', { threadId: 1 });
+      const frames = stackTrace.stackFrames || [];
+
+      // Get current line from top frame
+      const topFrame = frames[0];
+      if (!topFrame) return;
+
+      const currentLine = topFrame.line;
+      const currentFile = topFrame.source?.path || 'unknown';
+      const functionName = topFrame.name || 'unknown';
+
+      // Get variables for each frame
+      const stackData = [];
+      for (let i = 0; i < Math.min(frames.length, 5); i++) {
+        const frame = frames[i];
+        const frameId = frame.id;
+
+        // Get scopes for this frame
+        const scopes = await session.customRequest('scopes', { frameId });
+        const scope = scopes.scopes[0]; // Usually Local scope
+
+        // Get variables in this scope
+        const vars = await session.customRequest('variables', { variablesReference: scope.variablesReference });
+        
+        const locals = vars.variables.map(v => ({
+          name: v.name,
+          value: v.value,
+          type: v.type,
+          changed: false // We'll track this manually
+        }));
+
+        stackData.push({
+          id: `${frame.name}|${i}`,
+          name: frame.name,
+          line: frame.line,
+          active: i === 0,
+          status: i === 0 ? 'active' : 'waiting',
+          locals: locals,
+          args: []
+        });
+      }
+
+      // Build step data
+      const step = {
+        line: currentLine,
+        event: `Execute line ${currentLine} in ${functionName}`,
+        summary: `${functionName} at line ${currentLine}`,
+        stdout: '',
+        stack: stackData,
+        containers: this._extractContainers(stackData),
+        activeContainers: this._extractContainers([stackData[0]]),
+        memory: { nodes: [], edges: [] },
+        tree: this._buildFlowTree(stackData, currentLine)
+      };
+
+      // Check if this is a new step (different line)
+      const lastStep = this.steps[this.steps.length - 1];
+      if (!lastStep || lastStep.line !== currentLine) {
+        this.steps.push(step);
+        this.stepIndex = this.steps.length - 1;
+        
+        // Mark changed variables
+        if (lastStep) {
+          this._markChangedValues(lastStep, step);
+        }
+
+        // Send to panel
+        this._sendToPanel();
+      }
+
+    } catch (err) {
+      console.error('[CppFlow] Debug capture error:', err.message);
+    }
+  }
+
+  _extractContainers(stackData) {
+    const containers = {
+      arrays: [], maps: [], sets: [], stacks: [], queues: [],
+      priorityQueues: [], lists: [], graphs: [], unknowns: []
+    };
+
+    for (const frame of stackData) {
+      for (const local of frame.locals || []) {
+        const type = local.type || '';
+        const value = local.value || '';
+
+        // Try to detect container types from debugger output
+        if (type.includes('vector') || type.includes('std::vector')) {
+          const values = this._parseArrayValue(value);
+          containers.arrays.push({ name: local.name, kind: 'vector', values });
+        } else if (type.includes('map') || type.includes('std::map')) {
+          const entries = this._parseMapValue(value);
+          containers.maps.push({ name: local.name, kind: 'map', entries });
+        } else if (type.includes('set') || type.includes('std::set')) {
+          const values = this._parseArrayValue(value);
+          containers.sets.push({ name: local.name, kind: 'set', values });
+        } else if (type.includes('stack') || type.includes('std::stack')) {
+          const values = this._parseArrayValue(value);
+          containers.stacks.push({ name: local.name, values });
+        }
+        // Add more container types as needed
+      }
+    }
+
+    return containers;
+  }
+
+  _parseArrayValue(valueStr) {
+    // Parse debugger output like "{1, 2, 3}" or "[1, 2, 3]"
+    try {
+      const match = valueStr.match(/[\{\[](.+)[\}\]]/);
+      if (!match) return [];
+      return match[1].split(',').map(s => s.trim()).filter(s => s);
+    } catch {
+      return [];
+    }
+  }
+
+  _parseMapValue(valueStr) {
+    try {
+      const entries = [];
+      const match = valueStr.match(/[\{\[](.+)[\}\]]/);
+      if (!match) return [];
+      const pairs = match[1].split(',');
+      for (const pair of pairs) {
+        const [key, val] = pair.split(':').map(s => s.trim());
+        if (key && val) entries.push([key, val]);
+      }
+      return entries;
+    } catch {
+      return [];
+    }
+  }
+
+  _buildFlowTree(stackData, currentLine) {
+    const nodes = [];
+    const edges = [];
+
+    for (let i = 0; i < stackData.length; i++) {
+      const frame = stackData[i];
+      const nodeId = `${frame.name}@${frame.line}`;
+      
+      nodes.push({
+        id: nodeId,
+        label: `${frame.name}()`,
+        function: frame.name,
+        params: frame.args,
+        meta: `line ${frame.line}`,
+        active: i === 0,
+        done: false
+      });
+
+      if (i > 0) {
+        const parentId = `${stackData[i-1].name}@${stackData[i-1].line}`;
+        edges.push({ from: parentId, to: nodeId });
+      }
+    }
+
+    return { nodes, edges };
+  }
+
+  _markChangedValues(prevStep, currStep) {
+    const prevVars = new Map();
+    
+    for (const frame of prevStep.stack) {
+      for (const local of frame.locals) {
+        prevVars.set(`${frame.id}:${local.name}`, local.value);
+      }
+    }
+
+    for (const frame of currStep.stack) {
+      for (const local of frame.locals) {
+        const key = `${frame.id}:${local.name}`;
+        local.changed = prevVars.get(key) !== local.value;
+      }
+    }
+  }
+
+  _sendToPanel() {
+    if (!this.panel || !this.panel.panel) return;
+
+    const trace = {
+      title: 'Live VS Code Debugger',
+      code: this._getActiveEditorCode(),
+      stdout: '',
+      steps: this.steps
+    };
+
+    this.panel.panel.webview.postMessage({
+      type: 'traceResult',
+      trace: trace
+    });
+  }
+
+  _notifyPanel(event, message) {
+    if (!this.panel || !this.panel.panel) return;
+    this.panel.panel.webview.postMessage({
+      type: 'debugStatus',
+      event: event,
+      message: message
+    });
+  }
+
+  _getActiveEditorCode() {
+    const editor = vscode.window.activeTextEditor;
+    return editor ? editor.document.getText() : '';
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
    Activation
    ═══════════════════════════════════════════════════════ */
 function activate(context) {
+  // Create panel command
+  const openPanelCmd = vscode.commands.registerCommand('cppFlow.openPanel', () => {
+    if (!currentPanel) {
+      currentPanel = new CppFlowPanel(context.extensionUri);
+      currentPanel.panel.onDidDispose(() => { currentPanel = null; });
+    } else {
+      currentPanel.reveal();
+    }
+  });
+
+  // Connect to debugger command
+  const connectCmd = vscode.commands.registerCommand('cppFlow.connectDebugger', async () => {
+    if (!currentPanel) {
+      currentPanel = new CppFlowPanel(context.extensionUri);
+      currentPanel.panel.onDidDispose(() => { currentPanel = null; });
+    }
+
+    // Check if debugger is running
+    if (!vscode.debug.activeDebugSession) {
+      vscode.window.showWarningMessage('Pehle VS Code debugger start karo (F5), phir connect karo.');
+      return;
+    }
+
+    if (debugTracker) {
+      debugTracker.stop();
+    }
+
+    debugTracker = new DebugTracker(currentPanel);
+    debugTracker.start();
+
+    vscode.window.showInformationMessage('C++ Flow Studio connected to VS Code debugger!');
+  });
+
+  // Auto-connect when debugger starts
+  context.subscriptions.push(
+    vscode.debug.onDidStartDebugSession(() => {
+      if (currentPanel && !debugTracker) {
+        debugTracker = new DebugTracker(currentPanel);
+        debugTracker.start();
+      }
+    })
+  );
+
+  // Clean up when debugger stops
+  context.subscriptions.push(
+    vscode.debug.onDidTerminateDebugSession(() => {
+      if (debugTracker) {
+        debugTracker.stop();
+        debugTracker = null;
+      }
+    })
+  );
+
   // Hover provider
   context.subscriptions.push(
     vscode.languages.registerHoverProvider('cpp', {
@@ -311,68 +532,19 @@ function activate(context) {
               return new vscode.Hover(md, wordRange);
             }
           }
-          for (const arg of frame.args || []) {
-            const m = arg.match(/^(\w+)\s*=\s*(.+)$/);
-            if (m && m[1] === word) {
-              const md = new vscode.MarkdownString();
-              md.appendCodeblock(`${m[1]} = ${m[2]}`, 'cpp');
-              md.appendMarkdown(`\n\n*Frame:* \`${frame.name}\` (argument)`);
-              md.isTrusted = true;
-              return new vscode.Hover(md, wordRange);
-            }
-          }
         }
         return undefined;
       }
     })
   );
 
-  const cmd = vscode.commands.registerCommand('cppFlow.startDebugAndVisualize', async () => {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor || editor.document.languageId !== 'cpp') {
-      vscode.window.showErrorMessage('Pehle ek .cpp file kholo.');
-      return;
-    }
-    const code = editor.document.getText();
-    if (!code.trim()) {
-      vscode.window.showErrorMessage('File khali hai.');
-      return;
-    }
-
-    vscode.window.withProgress({
-      location: vscode.ProgressLocation.Notification,
-      title: 'C++ Flow Studio',
-      cancellable: true
-    }, async (progress, token) => {
-      try {
-        progress.report({ message: 'Compiling & tracing with LLDB...' });
-        const trace = await runDirectTrace(code, context.extensionUri);
-        if (token.isCancellationRequested) return;
-
-        progress.report({ message: 'Opening panel...' });
-        if (!currentPanel) {
-          currentPanel = new CppFlowPanel(context.extensionUri);
-          currentPanel.panel.onDidDispose(() => { currentPanel = null; });
-        } else {
-          currentPanel.reveal();
-        }
-        currentPanel.setTrace(trace, code);
-      } catch (err) {
-        vscode.window.showErrorMessage(`Flow Studio error: ${err.message || err}`);
-        console.error('[CppFlow] Full error:', err);
-        if (currentPanel) {
-          currentPanel.panel.webview.postMessage({
-            type: 'traceError',
-            error: err.message || String(err)
-          });
-        }
-      }
-    });
-  });
-
-  context.subscriptions.push(cmd);
+  context.subscriptions.push(openPanelCmd, connectCmd);
 }
 
-function deactivate() {}
+function deactivate() {
+  if (debugTracker) {
+    debugTracker.stop();
+  }
+}
 
 module.exports = { activate, deactivate };
