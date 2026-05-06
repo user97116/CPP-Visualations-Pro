@@ -753,6 +753,36 @@ button:hover {
   font-size: 0.84rem;
 }
 
+.memory-map-lines {
+  display: grid;
+  gap: 10px;
+}
+
+.memory-map-section {
+  border-radius: 14px;
+  border: 1px solid rgba(124, 184, 255, 0.12);
+  background: rgba(8, 14, 26, 0.65);
+  padding: 10px 12px;
+}
+
+.memory-map-title {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.memory-map-pre {
+  margin: 0;
+  font-family: var(--font-code);
+  font-size: 0.82rem;
+  line-height: 1.55;
+  color: #cfe0ff;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .memory-svg-scroll {
   overflow: auto;
   border-radius: 16px;

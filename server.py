@@ -318,7 +318,13 @@ def emit_step(debugger, command, result, internal_dict):
 
                 merged = empty_containers()
                 for kind in kinds:
-                    merged[kind] = list(current[kind]) if current.get(kind) else list(prev[kind])
+                    cur_k = current.get(kind) or []
+                    prev_k = prev.get(kind) or []
+                    merged[kind] = (
+                        merge_container_items_by_name(prev_k, cur_k)
+                        if cur_k
+                        else list(prev_k)
+                    )
 
                 frame["containers"] = merged
                 current_seen[frame_id] = merged
@@ -529,6 +535,41 @@ def merge_memory_graphs(
             seen_edges.add(key)
             merged["edges"].append(edge)
 
+    return merged
+
+
+def attach_container_address(payload: dict[str, Any], value_text: str) -> None:
+    """When LLDB prints a hex address on the value line, keep it for the container card."""
+    addr = normalize_address(extract_address(value_text))
+    if addr:
+        payload["address"] = addr
+
+
+def merge_container_items_by_name(
+    prev_items: list[dict[str, Any]],
+    cur_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Prefer fresh LLDB fields but carry stable metadata (e.g. address) across steps when the new parse omits it."""
+    if not cur_items:
+        return list(prev_items)
+    prev_by_name = {item["name"]: item for item in prev_items if item.get("name")}
+    merged: list[dict[str, Any]] = []
+    for item in cur_items:
+        name = item.get("name")
+        if not name or name not in prev_by_name:
+            merged.append(dict(item))
+            continue
+        old = prev_by_name[name]
+        combined = {**old, **item}
+        new_addr = item.get("address")
+        old_addr = old.get("address")
+        if new_addr:
+            combined["address"] = new_addr
+        elif old_addr:
+            combined["address"] = old_addr
+        else:
+            combined.pop("address", None)
+        merged.append(combined)
     return merged
 
 
@@ -909,25 +950,31 @@ def parse_frame_variables(
             if value_text.startswith("size="):
                 values, next_index = parse_set(rows, index)
                 if values is not None:
-                    containers["unknowns"].append({"name": name, "kind": typename, "values": values})
+                    unk: dict[str, Any] = {"name": name, "kind": typename, "values": values}
+                    attach_container_address(unk, value_text)
+                    containers["unknowns"].append(unk)
                     variables.append(make_local(name, values, typename))
                     index = next_index
                     continue
             if value_text == "{":
                 values, next_index = parse_indexed_block(rows, index)
                 if values is not None:
-                    containers["unknowns"].append({"name": name, "kind": typename, "values": values})
+                    unk = {"name": name, "kind": typename, "values": values}
+                    attach_container_address(unk, value_text)
+                    containers["unknowns"].append(unk)
                     variables.append(make_local(name, values, typename))
                     index = next_index
                     continue
 
         if value_text.endswith("{"):
-            containers["unknowns"].append({
+            unk = {
                 "name": name,
                 "kind": typename,
                 "values": [],
                 "preview": "Expand in Locals or use a supported STL shape"
-            })
+            }
+            attach_container_address(unk, value_text)
+            containers["unknowns"].append(unk)
             variables.append(make_local(name, f"⟨{typename}⟩", typename))
             index += 1
             while index < len(rows) and rows[index].strip() != "}":
@@ -940,7 +987,30 @@ def parse_frame_variables(
         index += 1
 
     merge_recursive_vector_heap_edges(memory, recursive_text)
+    annotate_memory_pointer_aliases(memory)
     return variables, containers, memory
+
+
+def annotate_memory_pointer_aliases(memory: dict[str, list[dict[str, str]]]) -> None:
+    """Tag address nodes so the UI can show p, q → @addr when several pointers share a target."""
+    incoming_vars: dict[str, list[str]] = {}
+    for edge in memory.get("edges", []):
+        source = edge.get("from") or ""
+        target = edge.get("to") or ""
+        if not target or not source.startswith("var:"):
+            continue
+        name = source[4:]
+        bucket = incoming_vars.setdefault(target, [])
+        if name not in bucket:
+            bucket.append(name)
+
+    for node in memory.get("nodes", []):
+        if node.get("kind") == "variable":
+            continue
+        addr = node.get("id") or ""
+        names = incoming_vars.get(addr, [])
+        if len(names) >= 2:
+            node["pointedBy"] = sorted(names)
 
 
 def _parse_vector_children(rows: list[str], index: int) -> tuple[list[Any], int]:

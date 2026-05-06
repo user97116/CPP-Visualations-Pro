@@ -640,6 +640,132 @@ function renderFlow(step) {
   dom.flowView.innerHTML = `${graphBlock}${listBlock}`;
 }
 
+function memoryMeaningfulEdgeLabel(edge) {
+  const raw = (edge.label || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const to = String(edge.to || "");
+  if (raw === to) {
+    return "";
+  }
+  if (raw.startsWith("0x") && to && raw.toLowerCase() === to.toLowerCase()) {
+    return "";
+  }
+  return raw;
+}
+
+function memoryNodeByIdMap(nodes) {
+  const m = new Map();
+  (nodes || []).forEach((n) => {
+    if (n?.id) {
+      m.set(n.id, n);
+    }
+  });
+  return m;
+}
+
+function memoryDisplayName(id, nodeById) {
+  if (id == null) {
+    return "?";
+  }
+  const sid = String(id);
+  const node = nodeById.get(sid);
+  if (node?.label) {
+    return node.label;
+  }
+  if (sid.startsWith("var:")) {
+    return sid.slice(4);
+  }
+  if (sid.startsWith("0x")) {
+    const body = sid.slice(2);
+    return body.length > 6 ? `0x${body.slice(0, 4)}…${body.slice(-3)}` : sid;
+  }
+  return sid;
+}
+
+function buildMemoryAddressMapLines(edges, nodeById) {
+  const list = edges || [];
+  if (!list.length) {
+    return "";
+  }
+
+  const byFrom = new Map();
+  for (const e of list) {
+    const from = e.from;
+    const to = e.to;
+    if (!from || !to) {
+      continue;
+    }
+    const lab = memoryMeaningfulEdgeLabel(e);
+    if (!byFrom.has(from)) {
+      byFrom.set(from, []);
+    }
+    const bucket = byFrom.get(from);
+    const hit = bucket.find((x) => x.to === to);
+    if (hit) {
+      if (lab && !hit.labels.includes(lab)) {
+        hit.labels.push(lab);
+      }
+    } else {
+      bucket.push({ to, labels: lab ? [lab] : [] });
+    }
+  }
+
+  const fanOut = [];
+  for (const [from, targets] of byFrom) {
+    if (targets.length < 2) {
+      continue;
+    }
+    const left = memoryDisplayName(from, nodeById);
+    const right = targets
+      .map(({ to, labels }) => {
+        const name = memoryDisplayName(to, nodeById);
+        return labels.length ? `${name} (${labels.join("/")})` : name;
+      })
+      .join(", ");
+    fanOut.push(`${left} → ${right}`);
+  }
+  fanOut.sort();
+
+  const byTo = new Map();
+  for (const e of list) {
+    const to = e.to;
+    const from = e.from;
+    if (!to || !from) {
+      continue;
+    }
+    if (!byTo.has(to)) {
+      byTo.set(to, new Set());
+    }
+    byTo.get(to).add(from);
+  }
+
+  const fanIn = [];
+  for (const [to, sources] of byTo) {
+    if (sources.size < 2) {
+      continue;
+    }
+    const left = [...sources].map((s) => memoryDisplayName(s, nodeById)).sort().join(", ");
+    const right = memoryDisplayName(to, nodeById);
+    fanIn.push(`${left} → ${right}`);
+  }
+  fanIn.sort();
+
+  const blocks = [];
+  if (fanOut.length) {
+    blocks.push(
+      `<div class="memory-map-section"><div class="memory-map-title">Fan-out (one → many)</div><pre class="memory-map-pre">${fanOut.map(escapeHtml).join("\n")}</pre></div>`
+    );
+  }
+  if (fanIn.length) {
+    blocks.push(
+      `<div class="memory-map-section"><div class="memory-map-title">Shared target (many → one)</div><pre class="memory-map-pre">${fanIn.map(escapeHtml).join("\n")}</pre></div>`
+    );
+  }
+  return blocks.length ? `<div class="memory-map-lines">${blocks.join("")}</div>` : "";
+}
+
 function renderMemory(step) {
   dom.memoryView.innerHTML = "";
 
@@ -656,6 +782,9 @@ function renderMemory(step) {
     dom.memoryView.innerHTML = `<div class="empty-state">No pointer-like addresses found at this step. Try linked list or tree node pointers.</div>`;
     return;
   }
+
+  const nodeById = memoryNodeByIdMap(nodes);
+  const addressMapHtml = buildMemoryAddressMapLines(edges, nodeById);
 
   const CW = 168;
   const CH = 58;
@@ -749,18 +878,35 @@ function renderMemory(step) {
   const renderNode = (n, x, y) => {
     const isAddr = n.kind !== "variable";
     const cls = isAddr ? "memory-node address-node" : "memory-node variable-node";
+    const outs = edges.filter((e) => e.from === n.id);
     const label = escapeHtml(n.label || n.id);
     let sub = "";
     let fullTitle = `${n.label || n.id}`;
     if (!isAddr) {
-      const out = edges.find((e) => e.from === n.id);
-      if (out) {
-        fullTitle = `${n.label} → ${out.to} (${out.label || "ref"})`;
-        sub = out.to.length > 14 ? `${out.to.slice(0, 6)}…${out.to.slice(-4)}` : out.to;
+      if (outs.length) {
+        const parts = outs.map((out) => memoryDisplayName(out.to, nodeById));
+        fullTitle = `${n.label} → ${parts.join(", ")}`;
+        sub = parts.join(", ");
+        if (sub.length > 30) {
+          sub = `${sub.slice(0, 27)}…`;
+        }
       }
     } else {
-      fullTitle = `Object @ ${n.id}`;
-      sub = n.id.length > 14 ? `${n.id.slice(0, 6)}…${n.id.slice(-4)}` : n.id;
+      const pb = Array.isArray(n.pointedBy) && n.pointedBy.length ? ` ← ${n.pointedBy.join(", ")}` : "";
+      fullTitle = `Object @ ${n.id}${pb}`;
+      const outSubs = outs.map((out) => {
+        const ml = memoryMeaningfulEdgeLabel(out);
+        const tn = memoryDisplayName(out.to, nodeById);
+        return ml ? `${tn} (${ml})` : tn;
+      });
+      if (outSubs.length) {
+        sub = outSubs.join(", ");
+        if (sub.length > 36) {
+          sub = `${sub.slice(0, 33)}…`;
+        }
+      } else {
+        sub = n.id.length > 14 ? `${n.id.slice(0, 6)}…${n.id.slice(-4)}` : n.id;
+      }
     }
     return `<g class="${cls}" transform="translate(${x},${y})">
       <title>${escapeHtml(fullTitle)}</title>
@@ -777,6 +923,7 @@ function renderMemory(step) {
 
   dom.memoryView.innerHTML = `
     <div class="memory-meta">${edges.length} edge${edges.length !== 1 ? "s" : ""} · ${varNodes.length} variable${varNodes.length !== 1 ? "s" : ""} · ${addrNodes.length} address${addrNodes.length !== 1 ? "es" : ""}</div>
+    ${addressMapHtml}
     <div class="memory-svg-scroll">
       <svg class="memory-svg" viewBox="0 0 ${svgW} ${svgH}" width="${svgW}" height="${svgH}" role="img" aria-label="Address graph">
         <defs>
@@ -882,6 +1029,25 @@ function createContainerDetails(name, type, typeClass, isActive) {
   </div>`;
   details.append(summary);
   return details;
+}
+
+function buildUnknownMetadataRows(unknown) {
+  const kind = String(unknown.kind || "unknown");
+  const rows = [
+    ["name", String(unknown.name ?? "")],
+    ["type", kind]
+  ];
+  if (unknown.address) {
+    rows.push(["address", String(unknown.address)]);
+  }
+  const n = Array.isArray(unknown.values) ? unknown.values.length : 0;
+  rows.push(["elements", String(n)]);
+  return rows
+    .map(
+      ([k, v]) =>
+        `<div class="ct-default-field"><span class="ct-default-k">${escapeHtml(k)}</span><span class="ct-default-v">${escapeHtml(v)}</span></div>`
+    )
+    .join("");
 }
 
 function renderContainers(step) {
@@ -1128,7 +1294,12 @@ function renderContainers(step) {
 
     // Unknowns
     containers.unknowns.forEach((unknown) => {
-      const card = createContainerDetails(unknown.name, shortType(unknown.kind || "unknown"), "unknown", frame.active);
+      const fullKind = unknown.kind || "unknown";
+      const card = createContainerDetails(unknown.name, shortType(fullKind), "unknown", frame.active);
+      const typeChip = card.querySelector(".container-type");
+      if (typeChip && fullKind.length > String(typeChip.textContent).length) {
+        typeChip.setAttribute("title", fullKind);
+      }
       const wrap = document.createElement("div");
       wrap.className = "ct-unknown-wrap";
       if (unknown.preview) {
@@ -1140,10 +1311,9 @@ function renderContainers(step) {
       const schema = document.createElement("div");
       schema.className = "ct-default-struct";
       schema.innerHTML = `
-        <div class="ct-default-struct-title">Default layout</div>
+        <div class="ct-default-struct-title">Container details</div>
         <div class="ct-default-struct-rows">
-          <div class="ct-default-field"><span class="ct-default-k">name</span><span class="ct-default-v">${escapeHtml(unknown.name)}</span></div>
-          <div class="ct-default-field"><span class="ct-default-k">type</span><span class="ct-default-v">${escapeHtml(shortType(unknown.kind || "unknown"))}</span></div>
+          ${buildUnknownMetadataRows(unknown)}
         </div>`;
       wrap.append(schema);
       if (!unknown.values || !unknown.values.length) {
